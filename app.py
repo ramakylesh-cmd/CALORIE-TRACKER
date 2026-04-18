@@ -18,7 +18,10 @@ openai_client = OpenAI(api_key=os.getenv("OPENAI_API_KEY"))
 USDA_API_KEY = os.getenv("USDA_API_KEY")
 
 app = Flask(__name__)
-app.secret_key = "nutripulse_ultra_v2_2024_xk9q"
+app.secret_key = os.getenv("SECRET_KEY", "nutripulse_ultra_v2_2024_xk9q")
+app.config["SESSION_COOKIE_SAMESITE"] = "Lax"
+app.config["SESSION_COOKIE_SECURE"] = False  # set True if HTTPS only
+app.config["PERMANENT_SESSION_LIFETIME"] = 86400 * 30  # 30 days
 
 
 
@@ -326,6 +329,7 @@ def _local_ai_feedback(entries, goals):
 # ─── ROUTES ──────────────────────────────────────────────────────────────────
 @app.route("/")
 def index():
+    session.permanent = True
     return render_template("index.html")
 
 
@@ -556,7 +560,7 @@ def analyze_photo():
         image_url = data["image"]
 
         response = openai_client.chat.completions.create(
-            model="gpt-4.1-mini",
+            model="gpt-4o-mini",
             messages=[
                 {
                     "role": "user",
@@ -656,4 +660,5 @@ def search_usda_route():
 
 
 if __name__ == "__main__":
-    app.run(host="0.0.0.0", port=5000, debug=True)
+   port = int(os.environ.get("PORT", 5000))
+   app.run(host="0.0.0.0", port=port, debug=False)

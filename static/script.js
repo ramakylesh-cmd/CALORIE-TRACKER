@@ -141,8 +141,23 @@ async function loadInitialData() {
     updateInsights(data.insights || []);
     updateWaterUI(currentWater);
 
-    // Load profile
-    if (data.profile) applyProfileToForm(data.profile);
+    // Load profile — localStorage first, then server
+    const localProfile = localStorage.getItem("nutripulse_profile");
+    if (localProfile) {
+      try {
+        const lp = JSON.parse(localProfile);
+        applyProfileToForm(lp);
+        // Push it to server so goals are correct
+        fetch("/update_profile", {
+          method: "POST", headers: { "Content-Type": "application/json" },
+          body: JSON.stringify(lp)
+        }).then(r => r.json()).then(d => {
+          if (d.status === "ok") { currentGoals = d.goals; updateGoalDisplay(); updateProfileGoalDisplay(d.goals); }
+        }).catch(() => {});
+      } catch(e) {}
+    } else if (data.profile) {
+      applyProfileToForm(data.profile);
+    }
     if (data.goals) updateProfileGoalDisplay(data.goals);
 
     // Load food list
@@ -577,6 +592,11 @@ async function handleClearLog() {
 // ── PROFILE FORM ──────────────────────────────────────────────────────────────
 function bindProfileForm() {
   document.getElementById("save-profile-btn").addEventListener("click", saveProfile);
+  // Load from localStorage first (instant, survives server restarts)
+  const saved = localStorage.getItem("nutripulse_profile");
+  if (saved) {
+    try { applyProfileToForm(JSON.parse(saved)); } catch(e) {}
+  }
 }
 
 async function saveProfile() {
@@ -589,6 +609,9 @@ async function saveProfile() {
     goal: document.getElementById("p-goal").value,
   };
 
+  // Save to localStorage immediately — survives server restarts & cross-device not needed
+  localStorage.setItem("nutripulse_profile", JSON.stringify(profile));
+
   try {
     const res = await fetch("/update_profile", {
       method: "POST", headers: { "Content-Type": "application/json" },
@@ -599,14 +622,13 @@ async function saveProfile() {
       currentGoals = data.goals;
       updateGoalDisplay();
       updateProfileGoalDisplay(data.goals);
-      showToast("Profile updated! Goals recalculated ⚡", "success");
-      // Sync UI
+      showToast("Profile saved! Goals recalculated ⚡", "success");
       const syncRes = await fetch("/get_totals");
       const syncData = await syncRes.json();
       recalcDashboard(syncData.entries || []);
       updateInsights(syncData.insights || []);
     }
-  } catch (e) { showToast("Failed to save profile.", "error"); }
+  } catch (e) { showToast("Saved locally. Server sync failed.", "error"); }
 }
 
 function applyProfileToForm(profile) {
@@ -716,10 +738,31 @@ function bindPhotoScan() {
 }
 
 function loadPhoto(file) {
-  const reader = new FileReader();
-  reader.onload = e => {
-    const dataUrl = e.target.result;
+  // Guard: reject files over 10MB before reading (prevents OOM crash on mobile)
+  if (file.size > 10 * 1024 * 1024) {
+    showPhotoFeedback("Image too large (max 10MB). Please use a smaller photo.", "error");
+    return;
+  }
+
+  const img = new Image();
+  const objectUrl = URL.createObjectURL(file);
+  img.onload = () => {
+    URL.revokeObjectURL(objectUrl);
+    // Resize to max 800px to avoid memory crash on mobile
+    const MAX = 800;
+    let { width, height } = img;
+    if (width > MAX || height > MAX) {
+      const ratio = Math.min(MAX / width, MAX / height);
+      width = Math.round(width * ratio);
+      height = Math.round(height * ratio);
+    }
+    const canvas = document.createElement("canvas");
+    canvas.width = width; canvas.height = height;
+    const ctx = canvas.getContext("2d");
+    ctx.drawImage(img, 0, 0, width, height);
+    const dataUrl = canvas.toDataURL("image/jpeg", 0.82);
     currentPhotoBase64 = dataUrl.split(",")[1];
+
     const preview = document.getElementById("photo-preview");
     preview.src = dataUrl;
     preview.classList.add("visible");
@@ -729,7 +772,11 @@ function loadPhoto(file) {
     document.getElementById("photo-result").classList.remove("visible");
     pendingPhotoResult = null;
   };
-  reader.readAsDataURL(file);
+  img.onerror = () => {
+    URL.revokeObjectURL(objectUrl);
+    showPhotoFeedback("Could not load image. Try a different file.", "error");
+  };
+  img.src = objectUrl;
 }
 
 async function analysePhoto() {
@@ -992,23 +1039,53 @@ function initPWA() {
     navigator.serviceWorker.register('/static/sw.js').catch(() => {});
   }
 
+  // Always show manual install button in header
+  const manualBtn = document.getElementById("pwa-manual-btn");
+  if (manualBtn) manualBtn.classList.remove("hidden");
+
   window.addEventListener('beforeinstallprompt', e => {
     e.preventDefault();
     deferredPrompt = e;
     const banner = document.getElementById("pwa-banner");
-    banner.classList.remove("hidden");
+    if (banner) banner.classList.remove("hidden");
+    if (manualBtn) manualBtn.classList.remove("hidden");
   });
 
-  document.getElementById("pwa-install-btn").addEventListener("click", async () => {
-    if (!deferredPrompt) return;
+  // Install via banner
+  const installBtn = document.getElementById("pwa-install-btn");
+  if (installBtn) {
+    installBtn.addEventListener("click", triggerInstall);
+  }
+  // Install via header button
+  if (manualBtn) {
+    manualBtn.addEventListener("click", triggerInstall);
+  }
+
+  const dismissBtn = document.getElementById("pwa-dismiss-btn");
+  if (dismissBtn) {
+    dismissBtn.addEventListener("click", () => {
+      document.getElementById("pwa-banner").classList.add("hidden");
+    });
+  }
+
+  // If already installed as standalone — hide banner
+  if (window.matchMedia('(display-mode: standalone)').matches) {
+    const banner = document.getElementById("pwa-banner");
+    if (banner) banner.classList.add("hidden");
+    if (manualBtn) manualBtn.classList.add("hidden");
+  }
+}
+
+async function triggerInstall() {
+  if (deferredPrompt) {
     deferredPrompt.prompt();
     const { outcome } = await deferredPrompt.userChoice;
     if (outcome === "accepted") showToast("App installed! 🚀", "success");
     deferredPrompt = null;
-    document.getElementById("pwa-banner").classList.add("hidden");
-  });
-
-  document.getElementById("pwa-dismiss-btn").addEventListener("click", () => {
-    document.getElementById("pwa-banner").classList.add("hidden");
-  });
+    const banner = document.getElementById("pwa-banner");
+    if (banner) banner.classList.add("hidden");
+  } else {
+    // Fallback instructions for browsers that don't support beforeinstallprompt
+    showToast("To install: tap Share → Add to Home Screen (iOS) or menu → Install App (Android/Chrome)", "info");
+  }
 }
