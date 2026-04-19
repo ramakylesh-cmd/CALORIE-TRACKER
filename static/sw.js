@@ -16,7 +16,7 @@
 // Old caches are auto-deleted in the activate event below.
 // =============================================================================
 
-const CACHE_NAME = "nutripulse-v3";
+const CACHE_NAME = "nutripulse-v4";
 
 const STATIC_ASSETS = [
   "/",

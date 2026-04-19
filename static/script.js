@@ -114,7 +114,7 @@ const toastContainer = document.getElementById("toast-container");
 // ── INIT ──────────────────────────────────────────────────────────────────────
 document.addEventListener("DOMContentLoaded", () => {
   setDateDisplay();
-  initParticles();
+  // Particles handled by NutriParticles module (particles.js)
   loadInitialData();
   bindEvents();
   bindModeToggle();
@@ -130,43 +130,6 @@ function setDateDisplay() {
   dateDisplay.textContent = new Date().toLocaleDateString("en-US", {
     weekday: "short", month: "short", day: "numeric", year: "numeric"
   }).toUpperCase();
-}
-
-// ── PARTICLES ─────────────────────────────────────────────────────────────────
-function initParticles() {
-  const canvas = document.getElementById("particle-canvas");
-  if (!canvas) return;
-  const ctx = canvas.getContext("2d");
-  let W, H, particles;
-
-  function resize() { W = canvas.width = window.innerWidth; H = canvas.height = window.innerHeight; }
-
-  function createParticles() {
-    particles = Array.from({ length: 70 }, () => ({
-      x: Math.random() * W, y: Math.random() * H,
-      r: Math.random() * 1.8 + 0.3,
-      vx: (Math.random() - .5) * .35, vy: (Math.random() - .5) * .35,
-      a: Math.random() * .5 + .1,
-      hue: Math.random() > .7 ? "155,111,255" : "200,255,62"
-    }));
-  }
-
-  function draw() {
-    ctx.clearRect(0, 0, W, H);
-    particles.forEach(p => {
-      p.x += p.vx; p.y += p.vy;
-      if (p.x < 0) p.x = W; if (p.x > W) p.x = 0;
-      if (p.y < 0) p.y = H; if (p.y > H) p.y = 0;
-      ctx.beginPath();
-      ctx.arc(p.x, p.y, p.r, 0, Math.PI * 2);
-      ctx.fillStyle = `rgba(${p.hue},${p.a})`;
-      ctx.fill();
-    });
-    requestAnimationFrame(draw);
-  }
-
-  resize(); createParticles(); draw();
-  window.addEventListener("resize", () => { resize(); createParticles(); });
 }
 
 // =============================================================================
@@ -269,34 +232,24 @@ document.getElementById("db-search").addEventListener("input", function () {
 
 // ── MODE TOGGLE ───────────────────────────────────────────────────────────────
 function bindModeToggle() {
-  document.querySelectorAll(".mode-btn").forEach(btn => {
-    btn.addEventListener("click", () => {
-      document.querySelectorAll(".mode-btn").forEach(b => b.classList.remove("active"));
-      btn.classList.add("active");
-      appState.currentMode = btn.dataset.mode;
-      if (appState.currentMode === "smart") {
-        document.getElementById("standard-mode").classList.add("hidden");
-        document.getElementById("smart-mode").classList.remove("hidden");
-        document.getElementById("smart-input").focus();
-      } else {
-        document.getElementById("standard-mode").classList.remove("hidden");
-        document.getElementById("smart-mode").classList.add("hidden");
-        foodInput.focus();
-      }
-    });
-  });
-
   const smartInput = document.getElementById("smart-input");
   const smartHint = document.getElementById("smart-hint");
 
-  smartInput.addEventListener("input", () => {
-    clearTimeout(appState.smartParseTimer);
-    const val = smartInput.value.trim();
-    if (!val) { smartHint.textContent = ""; smartHint.classList.add("hidden"); smartHint.classList.remove("visible"); return; }
-    appState.smartParseTimer = setTimeout(() => triggerSmartPreview(val), 400);
-  });
+  if(smartInput) {
+    smartInput.addEventListener("input", () => {
+      clearTimeout(appState.smartParseTimer);
+      const val = smartInput.value.trim();
+      if (!val) { smartHint.textContent = ""; smartHint.classList.add("hidden"); smartHint.classList.remove("visible"); return; }
+      appState.smartParseTimer = setTimeout(() => triggerSmartPreview(val), 400);
+    });
 
-  smartInput.addEventListener("keydown", e => { if (e.key === "Enter") handleAddFood(); });
+    smartInput.addEventListener("keydown", e => { 
+      if (e.key === "Enter") {
+        appState.currentMode = "smart";
+        handleAddFood(); 
+      }
+    });
+  }
 }
 
 async function triggerSmartPreview(val) {
@@ -322,14 +275,16 @@ async function triggerSmartPreview(val) {
 
 // ── BIND EVENTS ───────────────────────────────────────────────────────────────
 function bindEvents() {
-  addBtn.addEventListener("click", handleAddFood);
+  addBtn.addEventListener("click", () => { appState.currentMode = "standard"; handleAddFood(); });
   foodInput.addEventListener("keydown", e => { if (e.key === "Enter") qtyInput.focus(); });
-  qtyInput.addEventListener("keydown", e => { if (e.key === "Enter") handleAddFood(); });
+  qtyInput.addEventListener("keydown", e => { if (e.key === "Enter") { appState.currentMode = "standard"; handleAddFood(); } });
   foodInput.addEventListener("input", handleAutocomplete);
   foodInput.addEventListener("blur", () => setTimeout(() => acList.classList.add("hidden"), 160));
   foodInput.addEventListener("keydown", handleAcKeyboard);
   clearLogBtn.addEventListener("click", handleClearLog);
   barcodeBtn.addEventListener("click", openBarcodeModal);
+  const navBarcodeBtn = document.getElementById("nav-barcode-scanner");
+  if(navBarcodeBtn) navBarcodeBtn.addEventListener("click", openBarcodeModal);
   closeBarcodeBtn.addEventListener("click", closeBarcodeModal);
   barcodeModal.querySelector(".modal-backdrop").addEventListener("click", closeBarcodeModal);
   barcodeConfirm.addEventListener("click", confirmBarcodeFood);
@@ -749,6 +704,36 @@ function bindWater() {
     btn.addEventListener("click", () => addWater(parseInt(btn.dataset.ml)));
   });
   document.getElementById("water-reset-btn").addEventListener("click", resetWater);
+
+  const customMlInput = document.getElementById("water-custom-ml");
+  const customBtn = document.getElementById("water-custom-btn");
+  if(customBtn && customMlInput) {
+    customBtn.addEventListener("click", () => {
+      const ml = parseInt(customMlInput.value);
+      if(!isNaN(ml) && ml > 0) {
+        addWater(ml);
+        customMlInput.value = "";
+      }
+    });
+    customMlInput.addEventListener("keydown", (e) => {
+      if(e.key === "Enter") customBtn.click();
+    });
+  }
+
+  const dashCustomMlInput = document.getElementById("dash-water-custom-ml");
+  const dashCustomBtn = document.getElementById("dash-water-custom-btn");
+  if(dashCustomBtn && dashCustomMlInput) {
+    dashCustomBtn.addEventListener("click", () => {
+      const ml = parseInt(dashCustomMlInput.value);
+      if(!isNaN(ml) && ml > 0) {
+        addWater(ml);
+        dashCustomMlInput.value = "";
+      }
+    });
+    dashCustomMlInput.addEventListener("keydown", (e) => {
+      if(e.key === "Enter") dashCustomBtn.click();
+    });
+  }
 }
 
 async function addWater(ml) {
@@ -781,6 +766,12 @@ function updateWaterUI(water) {
   document.getElementById("water-display").textContent = `${consumed} / ${goal}ml`;
   document.getElementById("water-fill").style.width = pct + "%";
   hudWater.textContent = consumed >= 1000 ? (consumed / 1000).toFixed(1) + "L" : consumed + "ml";
+  
+  const scWater = document.getElementById("sc-water");
+  if (scWater) scWater.textContent = consumed + "ml";
+  const dashWaterText = document.getElementById("dash-water-text");
+  if (dashWaterText) dashWaterText.textContent = `${consumed} / ${goal}ml`;
+
   const goalText = document.getElementById("water-goal-text");
   if (pct >= 100) goalText.textContent = "🎉 Hydration goal crushed!";
   else if (pct >= 75) goalText.textContent = "💧 Almost there! Keep drinking.";
@@ -1041,8 +1032,10 @@ function showToast(msg, type = "info") {
   t.textContent = msg;
   toastContainer.appendChild(t);
   setTimeout(() => {
-    t.classList.add("fade-out");
-    t.addEventListener("animationend", () => t.remove());
+    t.style.transition = "all 0.3s ease";
+    t.style.opacity = "0";
+    t.style.transform = "translateX(50px)";
+    setTimeout(() => t.remove(), 300);
   }, 2800);
 }
 

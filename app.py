@@ -56,6 +56,9 @@ groq_client = OpenAI(
 # USDA FoodData Central — fallback when food not in local NUTRITION_DB
 USDA_API_KEY = os.getenv("USDA_API_KEY")
 
+# Google OAuth — Sign-In with Google Identity Services
+GOOGLE_CLIENT_ID = os.getenv("GOOGLE_CLIENT_ID")
+
 app = Flask(__name__)
 
 # === SECURITY: SECRET KEY ===
@@ -431,7 +434,56 @@ def _local_ai_feedback(entries, goals):
 @app.route("/")
 def index():
     session.permanent = True
-    return render_template("index.html")
+    user = session.get("user", None)
+    return render_template("index.html", google_client_id=GOOGLE_CLIENT_ID or "", user=user)
+
+
+# ── GOOGLE AUTH ────────────────────────────────────────────────────────────────
+@app.route("/auth/google", methods=["POST"])
+def auth_google():
+    """Verify Google ID token and create session."""
+    credential = request.json.get("credential", "")
+    if not credential:
+        return jsonify({"status": "error", "message": "No credential"}), 400
+    try:
+        # Verify the JWT with Google's tokeninfo endpoint
+        resp = requests.get(
+            "https://oauth2.googleapis.com/tokeninfo",
+            params={"id_token": credential},
+            timeout=5,
+        )
+        if resp.status_code != 200:
+            return jsonify({"status": "error", "message": "Invalid token"}), 401
+        payload = resp.json()
+        # Verify audience matches our client ID
+        if payload.get("aud") != GOOGLE_CLIENT_ID:
+            return jsonify({"status": "error", "message": "Token audience mismatch"}), 401
+        user = {
+            "email": payload.get("email", ""),
+            "name": payload.get("name", payload.get("email", "User")),
+            "picture": payload.get("picture", ""),
+            "sub": payload.get("sub", ""),
+        }
+        session["user"] = user
+        logger.info(f"Google sign-in: {user['email']}")
+        return jsonify({"status": "ok", "user": user})
+    except Exception as e:
+        logger.error(f"Google auth error: {e}")
+        return jsonify({"status": "error", "message": str(e)}), 500
+
+
+@app.route("/auth/logout", methods=["POST"])
+def auth_logout():
+    session.pop("user", None)
+    return jsonify({"status": "ok"})
+
+
+@app.route("/auth/me", methods=["GET"])
+def auth_me():
+    user = session.get("user", None)
+    if user:
+        return jsonify({"status": "ok", "user": user})
+    return jsonify({"status": "ok", "user": None})
 
 
 @app.route("/get_totals", methods=["GET"])
