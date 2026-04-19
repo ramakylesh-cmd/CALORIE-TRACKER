@@ -886,12 +886,13 @@ function loadPhoto(file) {
 async function analysePhoto() {
   if (!appState.currentPhotoBase64) return;
   const analyseBtn = document.getElementById("analyse-btn");
+  const dropArea = document.getElementById("photo-drop-area");
   const progressBar = document.getElementById("scan-progress");
   const progressFill = document.getElementById("scan-progress-fill");
   const feedback = document.getElementById("photo-feedback");
-  const analyseBtnText = analyseBtn.querySelector(".analyse-icon");
 
   analyseBtn.disabled = true;
+  if (dropArea) dropArea.classList.add("scanning");
   progressBar.classList.add("visible");
   feedback.classList.add("hidden");
   document.getElementById("photo-result").classList.remove("visible");
@@ -946,7 +947,16 @@ async function analysePhoto() {
 
     if (data.status === "ok") {
       const n = data.nutrition;
-      appState.pendingPhotoResult = { food_name: data.food_name, quantity_g: data.quantity_g };
+      appState.pendingPhotoResult = {
+        food_name: data.food_name,
+        quantity_g: data.quantity_g,
+        nutrition: {
+          calories: n.calories,
+          protein: n.protein,
+          carbs: n.carbs,
+          fats: n.fats
+        }
+      };
 
       document.getElementById("photo-result-food").textContent =
         `${data.food_name} (~${data.quantity_g}g)`;
@@ -958,9 +968,11 @@ async function analysePhoto() {
       document.getElementById("photo-result").classList.add("visible");
 
       // Show which pipeline was used (subtle, in the feedback area)
-      const sourceLabel = data.source === "groq+gemini" ? "AI Vision + AI Macros"
+      const sourceLabel = data.source === "groq+groq" ? "AI Vision + AI Macros"
         : data.source === "groq+usda" ? "AI Vision + USDA"
           : data.source === "groq+localdb" ? "AI Vision + Local DB"
+            : data.source === "manual+localdb" ? "Manual Notes + Local DB"
+              : data.source === "manual+usda" ? "Manual Notes + USDA"
             : "AI";
       showPhotoFeedback(`✅ Analyzed via ${sourceLabel}`, "success");
     } else {
@@ -975,6 +987,7 @@ async function analysePhoto() {
     console.error("Photo analysis error:", err);
   } finally {
     analyseBtn.disabled = false;
+    if (dropArea) dropArea.classList.remove("scanning");
   }
 }
 
@@ -987,11 +1000,11 @@ function showPhotoFeedback(msg, type) {
 
 async function addPhotoResultToLog() {
   if (!appState.pendingPhotoResult) return;
-  const { food_name, quantity_g } = appState.pendingPhotoResult;
+  const { food_name, quantity_g, nutrition } = appState.pendingPhotoResult;
 
-  const body = { food_name, quantity: quantity_g };
+  const body = { food_name, quantity_g, nutrition };
   try {
-    const res = await fetch("/add_food", {
+    const res = await fetch("/add_ai_entry", {
       method: "POST", headers: { "Content-Type": "application/json" },
       body: JSON.stringify(body)
     });
@@ -1055,14 +1068,39 @@ function closeBarcodeModal() { stopBarcodeScanner(); barcodeModal.classList.add(
 
 function startBarcodeScanner() {
   if (appState.barcodeScanning) return;
+  const viewport = document.getElementById("scanner-viewport");
   const video = document.getElementById("scanner-video");
   if (typeof Quagga === "undefined") { barcodeStatus.textContent = "Scanner library not loaded."; return; }
+  if (!viewport) { barcodeStatus.textContent = "Scanner viewport missing."; return; }
+  // Quagga expects a container node as target; passing <video> can break rendering on mobile.
+  viewport.querySelectorAll("canvas, video").forEach(el => {
+    if (el !== video) el.remove();
+  });
+
+  try { Quagga.offDetected(); } catch (e) { }
   Quagga.init({
-    inputStream: { name: "Live", type: "LiveStream", target: video, constraints: { facingMode: "environment", width: 640, height: 240 } },
+    inputStream: {
+      name: "Live",
+      type: "LiveStream",
+      target: viewport,
+      constraints: {
+        facingMode: { ideal: "environment" },
+        width: { ideal: 1280 },
+        height: { ideal: 720 }
+      }
+    },
     decoder: { readers: ["ean_reader", "ean_8_reader", "upc_reader", "upc_e_reader", "code_128_reader"] },
     locate: true, numOfWorkers: 2, frequency: 10,
   }, err => {
-    if (err) { barcodeStatus.textContent = "Camera access denied or unavailable."; return; }
+    if (err) {
+      const secureContextNeeded = !window.isSecureContext && location.hostname !== "localhost";
+      if (secureContextNeeded) {
+        barcodeStatus.textContent = "Camera requires HTTPS. Open this app on a secure URL.";
+      } else {
+        barcodeStatus.textContent = "Camera blocked/unavailable. Allow permission and retry.";
+      }
+      return;
+    }
     Quagga.start(); appState.barcodeScanning = true;
     barcodeStatus.textContent = "Point camera at a barcode";
   });

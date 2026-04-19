@@ -497,6 +497,60 @@ def add_food():
     })
 
 
+@app.route("/add_ai_entry", methods=["POST"])
+@limiter.limit("60 per minute")
+def add_ai_entry():
+    """
+    Add a fully-resolved AI photo entry directly to the log.
+    This preserves AI-estimated macros instead of rematching in local DB.
+    """
+    data = request.get_json(silent=True)
+    if not data:
+        return jsonify({"status": "error", "message": "Invalid request body"}), 400
+
+    food_name = str(data.get("food_name", "")).strip()
+    quantity_g = data.get("quantity_g")
+    nutrition = data.get("nutrition", {})
+
+    if not food_name:
+        return jsonify({"status": "error", "message": "Food name cannot be empty"}), 400
+    try:
+        quantity_g = float(quantity_g)
+    except (TypeError, ValueError):
+        return jsonify({"status": "error", "message": "Quantity must be a number"}), 400
+    if quantity_g <= 0 or quantity_g > 5000:
+        return jsonify({"status": "error", "message": "Quantity out of range"}), 400
+
+    try:
+        calories = round(float(nutrition.get("calories", 0)), 1)
+        protein = round(float(nutrition.get("protein", 0)), 1)
+        carbs = round(float(nutrition.get("carbs", 0)), 1)
+        fats = round(float(nutrition.get("fats", 0)), 1)
+    except (TypeError, ValueError):
+        return jsonify({"status": "error", "message": "Invalid nutrition values"}), 400
+
+    if min(calories, protein, carbs, fats) < 0:
+        return jsonify({"status": "error", "message": "Nutrition values cannot be negative"}), 400
+
+    entry = {
+        "id": str(uuid.uuid4()),
+        "food_name": food_name.title(),
+        "quantity_g": round(quantity_g, 1),
+        "calories": calories,
+        "protein": protein,
+        "carbs": carbs,
+        "fats": fats,
+        "matched_score": 1.0,
+    }
+    log = _get_log()
+    log.append(entry)
+    _save_log(log)
+    profile = _get_profile()
+    goals = _calc_goals(profile)
+    insights = _local_ai_feedback(log, goals)
+    return jsonify({"status": "ok", "entry": entry, "insights": insights, "goals": goals})
+
+
 @app.route("/delete_entry", methods=["POST"])
 def delete_entry():
     data = request.get_json(silent=True)
@@ -660,6 +714,130 @@ def _query_usda(query):
         return None
 
 
+def _extract_quantity_from_text(text):
+    """Extract an approximate gram quantity from free text."""
+    if not text:
+        return None
+    # Prefer explicit grams first: "150g", "150 g", "150 grams"
+    g_match = re.search(r'(\d+(?:\.\d+)?)\s*(?:g|gm|gram|grams)\b', text.lower())
+    if g_match:
+        try:
+            qty = float(g_match.group(1))
+            if 1 <= qty <= 5000:
+                return qty
+        except (TypeError, ValueError):
+            pass
+    # Fallback: any standalone number that looks like a plausible serving grams
+    n_match = re.search(r'\b(\d+(?:\.\d+)?)\b', text)
+    if n_match:
+        try:
+            qty = float(n_match.group(1))
+            if 1 <= qty <= 5000:
+                return qty
+        except (TypeError, ValueError):
+            pass
+    return None
+
+
+def _parse_manual_food_segments(manual_name, total_grams=None):
+    """
+    Parse mixed manual food text into structured segments.
+    Example: "curd 200g, rasam rice 150g" -> [{"name": "curd", "grams": 200}, ...]
+    """
+    if not manual_name:
+        return []
+    raw_parts = re.split(r'\s*(?:,|\+|/|\band\b|&)\s*', manual_name, flags=re.IGNORECASE)
+    segments = []
+    for part in raw_parts:
+        chunk = part.strip()
+        if not chunk:
+            continue
+        grams = _extract_quantity_from_text(chunk)
+        cleaned = re.sub(r'\babout|approx|approximately|around|near|~\b', ' ', chunk, flags=re.IGNORECASE)
+        cleaned = re.sub(r'\d+(?:\.\d+)?\s*(?:g|gm|gram|grams)?\b', ' ', cleaned, flags=re.IGNORECASE)
+        cleaned = re.sub(r'\s+', ' ', cleaned).strip()
+        if cleaned:
+            segments.append({"name": cleaned, "grams": grams})
+
+    if not segments:
+        return []
+
+    # If a total is provided, distribute remaining grams equally among unspecified segments.
+    if total_grams and total_grams > 0:
+        known = sum(s["grams"] for s in segments if s["grams"])
+        unknown = [s for s in segments if not s["grams"]]
+        remaining = max(0.0, total_grams - known)
+        if unknown:
+            each = remaining / len(unknown) if remaining > 0 else total_grams / len(segments)
+            for seg in unknown:
+                seg["grams"] = each
+
+    # Final fallback grams for any segment still missing
+    for seg in segments:
+        if not seg["grams"] or seg["grams"] <= 0:
+            seg["grams"] = 100.0
+
+    return segments
+
+
+def _fallback_photo_from_manual(manual_name, manual_grams):
+    """
+    Non-AI fallback for photo analysis when Groq is unavailable.
+    Uses manual text + local DB / USDA search.
+    """
+    if not manual_name:
+        return None
+    total_grams = manual_grams or _extract_quantity_from_text(manual_name) or 100.0
+    segments = _parse_manual_food_segments(manual_name, total_grams=total_grams)
+    if not segments:
+        return None
+
+    total = {"calories": 0.0, "protein": 0.0, "carbs": 0.0, "fats": 0.0}
+    resolved_names = []
+    used_usda = False
+
+    for seg in segments:
+        seg_name = seg["name"]
+        seg_grams = float(seg.get("grams", 100.0))
+        matched_key, score = _fuzzy_match(seg_name)
+        if matched_key and score >= 0.2:
+            nd = NUTRITION_DB[matched_key]
+            resolved_names.append(matched_key.title())
+            total["calories"] += _scale(nd["calories"], seg_grams)
+            total["protein"] += _scale(nd["protein"], seg_grams)
+            total["carbs"] += _scale(nd["carbs"], seg_grams)
+            total["fats"] += _scale(nd["fats"], seg_grams)
+            continue
+
+        usda = _query_usda(seg_name)
+        if not usda:
+            continue
+        used_usda = True
+        resolved_names.append(usda["name"].title())
+        total["calories"] += _scale(usda["calories"], seg_grams)
+        total["protein"] += _scale(usda["protein"], seg_grams)
+        total["carbs"] += _scale(usda["carbs"], seg_grams)
+        total["fats"] += _scale(usda["fats"], seg_grams)
+
+    if not resolved_names:
+        return None
+
+    quantity_g = sum(float(seg.get("grams", 0)) for seg in segments)
+    source = "manual+usda" if used_usda else "manual+localdb"
+    return {
+        "status": "ok",
+        "food_name": " + ".join(resolved_names[:4]),
+        "quantity_g": round(quantity_g, 1),
+        "nutrition": {
+            "calories": round(total["calories"], 1),
+            "protein": round(total["protein"], 1),
+            "carbs": round(total["carbs"], 1),
+            "fats": round(total["fats"], 1),
+        },
+        "source": source,
+    }
+
+
 # =============================================================================
 # === ROUTE: POST /analyze_photo — GROQ-ONLY VISION PIPELINE ===
 # =============================================================================
@@ -679,9 +857,6 @@ def analyze_photo():
         if not data or "image" not in data:
             return jsonify({"status": "error", "message": "No image provided"}), 400
 
-        if not groq_client:
-            return jsonify({"status": "error", "message": "GROQ_API_KEY not configured. Get one free at console.groq.com"}), 500
-
         image_url = data["image"]  # full data URL — Groq accepts this directly
         manual_name = str(data.get("manual_name", "")).strip()
         manual_grams = data.get("manual_grams")
@@ -689,6 +864,16 @@ def analyze_photo():
             manual_grams = float(manual_grams) if manual_grams else None
         except (ValueError, TypeError):
             manual_grams = None
+
+        if not groq_client:
+            fallback = _fallback_photo_from_manual(manual_name, manual_grams)
+            if fallback:
+                fallback["note"] = "AI key missing: estimated from manual description."
+                return jsonify(fallback)
+            return jsonify({
+                "status": "error",
+                "message": "GROQ_API_KEY not configured. Add a manual food description (and optional grams) for fallback analysis."
+            }), 500
 
         # ── STEP 1: Groq Vision — identify food from photo ──────────────────
         # If user gave a manual description, bake it into the prompt for accuracy
@@ -705,8 +890,9 @@ def analyze_photo():
             )
         else:
             vision_prompt = (
-                "Look at this food photo. Identify the main food item visible and "
-                "estimate its weight in grams as served. "
+                "Look at this food photo and identify all major visible food components "
+                "(for mixed meals, include rice/curry/side/snack separately in one name). "
+                "Estimate total meal weight in grams as served. "
                 "Respond ONLY with a JSON object — no markdown, no extra text — "
                 "using exactly these keys: "
                 '{"food_name": "name of the food", "quantity_g": 150, '

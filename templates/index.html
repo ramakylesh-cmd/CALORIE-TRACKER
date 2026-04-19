@@ -212,8 +212,17 @@
 
       <!-- ── TAB: PHOTO AI ─────────────────────────────────────────────── -->
       <div class="tab-pane" id="ltab-photo">
-        <p class="input-label" style="margin-bottom:10px">Take a photo or upload from gallery for instant AI analysis
-        </p>
+        <div class="photo-tab-head">
+          <p class="photo-tab-title">AI Meal Scanner</p>
+          <p class="photo-tab-subtitle">Upload, analyze, then log a clean macro estimate in one flow.</p>
+          <div class="photo-steps" aria-label="Photo analysis steps">
+            <span class="photo-step">1. Upload</span>
+            <span class="photo-step-dot"></span>
+            <span class="photo-step">2. Analyze</span>
+            <span class="photo-step-dot"></span>
+            <span class="photo-step">3. Add to Log</span>
+          </div>
+        </div>
 
         <!-- Hidden inputs — camera and gallery separate for mobile -->
         <input type="file" id="photo-input-camera" accept="image/*" capture="environment" style="display:none" />
@@ -251,21 +260,21 @@
         </div>
 
         <!-- Manual override — visible as soon as photo is loaded -->
-        <div id="photo-manual-box"
-          style="display:none;margin-top:10px;background:var(--surface2);border:1px solid var(--border2);border-radius:var(--radius-sm);padding:12px;gap:8px;flex-direction:column">
-          <p class="input-label" style="font-size:11px;color:var(--accent);margin-bottom:4px">✏️ Optional: Tell AI
-            what's in the photo</p>
-          <input type="text" id="photo-manual-name" class="input-field" style="font-size:13px;padding:8px 10px"
+        <div id="photo-manual-box" class="photo-manual-box">
+          <p class="input-label photo-manual-label">Optional: tell AI what is in the photo</p>
+          <input type="text" id="photo-manual-name" class="input-field photo-manual-input"
             placeholder="e.g. 2 dosa, 1 cup sambar, 200g chutney" autocomplete="off" />
-          <div style="display:flex;gap:8px">
-            <div style="flex:1">
-              <label class="input-label" style="font-size:10px;margin-bottom:3px;display:block">Weight (g) —
-                optional</label>
-              <input type="number" id="photo-manual-grams" class="input-field" style="font-size:13px;padding:8px 10px"
+          <p class="photo-manual-tip">
+            Tip: mixed meals work best like <strong>curd 200g, rasam rice 150g</strong>.
+          </p>
+          <div class="photo-manual-row">
+            <div class="photo-manual-col">
+              <label class="input-label photo-manual-weight-label">Weight (g) — optional</label>
+              <input type="number" id="photo-manual-grams" class="input-field photo-manual-input"
                 placeholder="e.g. 400" min="1" max="5000" inputmode="decimal" />
             </div>
           </div>
-          <p style="font-size:10px;color:var(--muted)">Leave blank to let AI guess — fill in for accurate macros</p>
+          <p class="photo-manual-footnote">Leave blank to let AI guess weight automatically.</p>
         </div>
 
         <div class="scan-progress" id="scan-progress">
@@ -277,12 +286,12 @@
           CLICK TO ANALYSE
         </button>
 
-        <div id="photo-feedback" class="feedback hidden" style="margin-top:10px"></div>
+        <div id="photo-feedback" class="feedback hidden photo-feedback"></div>
 
         <div class="photo-result" id="photo-result">
           <div class="photo-result-food" id="photo-result-food">—</div>
           <div class="photo-result-macros" id="photo-result-macros"></div>
-          <button id="photo-add-btn" class="btn-secondary" style="margin-top:10px">
+          <button id="photo-add-btn" class="btn-secondary photo-add-btn">
             <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5">
               <line x1="12" y1="5" x2="12" y2="19" />
               <line x1="5" y1="12" x2="19" y2="12" />
