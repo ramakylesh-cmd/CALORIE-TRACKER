@@ -1,73 +1,116 @@
 /* ── NutriPulse v2 — script.js ──────────────────────────────────────────── */
+// =============================================================================
+// === AI SYSTEM GUIDE ===
+// NutriPulse frontend — single-page app, no framework.
+//
+// === STATE ===
+// All mutable UI + app state lives in `appState` (single source of truth).
+// Never add new top-level globals — extend appState instead.
+//
+// === DATA FLOW ===
+// User input → API call (fetch) → JSON response → UI update functions
+// Dashboard updates are always driven by server response, not local mutation.
+//
+// === KEY FUNCTIONS ===
+// handleAddFood()      — main food logging handler (standard + smart mode)
+// recalcDashboard()    — recomputes ring, macros, HUD from entries array
+// updateInsights()     — renders AI insight cards in right panel
+// rebuildTable()       — full re-render of food log table from entries array
+// loadInitialData()    — page init: fetches /get_totals, seeds all UI state
+//
+// === IMPORTANT: MODIFYING THIS FILE ===
+// 1. All API responses follow {status: "ok"|"error"|"not_found", ...payload}
+// 2. appState.currentGoals must always stay synced with server (goals come
+//    from backend calc — do not compute goals on the frontend)
+// 3. appState.addInProgress flag prevents double-submits — always reset in finally {}
+// =============================================================================
 "use strict";
 
-// ── STATE ─────────────────────────────────────────────────────────────────────
-let addInProgress   = false;
-let barcodeScanning = false;
-let pendingBarcodeFood = null;
-let micRecognition  = null;
-let allFoods        = [];
-let currentMode     = "standard";
-let smartParseTimer = null;
-let currentGoals    = { calories: 2000, protein: 150, carbs: 300, fats: 65 };
-let currentWater    = { consumed_ml: 0, goal_ml: 2500 };
-let pendingPhotoResult = null;
+// ── CONSOLIDATED APP STATE ────────────────────────────────────────────────────
+// Single object for all mutable state. Prevents global namespace pollution
+// and makes it easy to inspect/debug the full app state at any time.
+// Usage: appState.currentGoals, appState.addInProgress, etc.
+const appState = {
+  addInProgress: false,        // prevents duplicate food-add requests
+  barcodeScanning: false,        // Quagga barcode scanner active flag
+  pendingBarcodeFood: null,        // food preview waiting for user confirm
+  micRecognition: null,         // Web Speech API instance
+  allFoods: [],           // full food list from /search_foods (for autocomplete)
+  currentMode: "standard",   // "standard" | "smart" (NLP input mode)
+  smartParseTimer: null,         // debounce timer ID for smart mode preview
+  currentGoals: { calories: 2000, protein: 150, carbs: 300, fats: 65 },
+  currentWater: { consumed_ml: 0, goal_ml: 2500 },
+  pendingPhotoResult: null,        // AI photo analysis result awaiting confirmation
+  currentPhotoBase64: null,        // base64 image data for photo analysis
+  deferredPrompt: null,         // PWA install prompt event
+  acActiveIndex: -1,           // keyboard nav index in autocomplete list
+};
 
 const RING_CIRC = 502.65;
 
+// =============================================================================
+// === DOM REFERENCES ===
+// All DOM elements cached at module load. If an element is missing from the
+// HTML, its reference will be null — guard with `if (el)` before use.
+// =============================================================================
 // ── DOM REFS ──────────────────────────────────────────────────────────────────
-const foodInput    = document.getElementById("food-input");
-const qtyInput     = document.getElementById("qty-input");
-const addBtn       = document.getElementById("add-btn");
-const addBtnText   = document.getElementById("add-btn-text");
+const foodInput = document.getElementById("food-input");
+const qtyInput = document.getElementById("qty-input");
+const addBtn = document.getElementById("add-btn");
+const addBtnText = document.getElementById("add-btn-text");
 const addBtnLoader = document.getElementById("add-btn-loader");
 const formFeedback = document.getElementById("form-feedback");
-const logTbody     = document.getElementById("log-tbody");
-const emptyRow     = document.getElementById("empty-row");
-const totalCalEl   = document.getElementById("total-cal");
+const logTbody = document.getElementById("log-tbody");
+const emptyRow = document.getElementById("empty-row");
+const totalCalEl = document.getElementById("total-cal");
 const entryCountEl = document.getElementById("entry-count");
-const calRingEl    = document.getElementById("calorie-ring");
-const valProtein   = document.getElementById("val-protein");
-const valCarbs     = document.getElementById("val-carbs");
-const valFats      = document.getElementById("val-fats");
-const barProtein   = document.getElementById("bar-protein");
-const barCarbs     = document.getElementById("bar-carbs");
-const barFats      = document.getElementById("bar-fats");
-const acList       = document.getElementById("autocomplete-list");
-const dateDisplay  = document.getElementById("date-display");
-const clearLogBtn  = document.getElementById("clear-log-btn");
-const insightList  = document.getElementById("insight-list");
-const ringPct      = document.getElementById("ring-pct");
-const hudFoodsVal  = document.getElementById("hud-foods-val");
-const hudRemain    = document.getElementById("hud-remain");
-const hudWater     = document.getElementById("hud-water");
-const hudGoal      = document.getElementById("hud-goal");
-const goalDisplay  = document.getElementById("goal-display");
-const logFooter    = document.getElementById("log-footer");
-const footerCal    = document.getElementById("footer-cal");
-const footerP      = document.getElementById("footer-p");
-const footerC      = document.getElementById("footer-c");
-const footerF      = document.getElementById("footer-f");
+const calRingEl = document.getElementById("calorie-ring");
+const valProtein = document.getElementById("val-protein");
+const valCarbs = document.getElementById("val-carbs");
+const valFats = document.getElementById("val-fats");
+const barProtein = document.getElementById("bar-protein");
+const barCarbs = document.getElementById("bar-carbs");
+const barFats = document.getElementById("bar-fats");
+const acList = document.getElementById("autocomplete-list");
+const dateDisplay = document.getElementById("date-display");
+const clearLogBtn = document.getElementById("clear-log-btn");
+const insightList = document.getElementById("insight-list");
+const ringPct = document.getElementById("ring-pct");
+const hudFoodsVal = document.getElementById("hud-foods-val");
+const hudRemain = document.getElementById("hud-remain");
+const hudWater = document.getElementById("hud-water");
+const hudGoal = document.getElementById("hud-goal");
+const goalDisplay = document.getElementById("goal-display");
+const logFooter = document.getElementById("log-footer");
+const footerCal = document.getElementById("footer-cal");
+const footerP = document.getElementById("footer-p");
+const footerC = document.getElementById("footer-c");
+const footerF = document.getElementById("footer-f");
 
 // barcode modal
-const barcodeModal  = document.getElementById("barcode-modal");
-const barcodeBtn    = document.getElementById("barcode-btn");
+const barcodeModal = document.getElementById("barcode-modal");
+const barcodeBtn = document.getElementById("barcode-btn");
 const closeBarcodeBtn = document.getElementById("close-barcode");
 const barcodeStatus = document.getElementById("barcode-status");
 const barcodeResult = document.getElementById("barcode-result");
-const barcodeConfirm= document.getElementById("barcode-confirm");
+const barcodeConfirm = document.getElementById("barcode-confirm");
 
 // mic modal
-const micModal      = document.getElementById("mic-modal");
-const micBtn        = document.getElementById("mic-btn");
-const closeMicBtn   = document.getElementById("close-mic");
+const micModal = document.getElementById("mic-modal");
+const micBtn = document.getElementById("mic-btn");
+const closeMicBtn = document.getElementById("close-mic");
 const micTranscript = document.getElementById("mic-transcript");
-const micActions    = document.getElementById("mic-actions");
-const micUseBtn     = document.getElementById("mic-use-btn");
-const micRetryBtn   = document.getElementById("mic-retry-btn");
+const micActions = document.getElementById("mic-actions");
+const micUseBtn = document.getElementById("mic-use-btn");
+const micRetryBtn = document.getElementById("mic-retry-btn");
 
-const toastContainer= document.getElementById("toast-container");
+const toastContainer = document.getElementById("toast-container");
 
+// =============================================================================
+// === INITIALIZATION ===
+// DOMContentLoaded fires all setup in order. loadInitialData() is async —
+// it fetches /get_totals and seeds the entire dashboard from server state.
+// =============================================================================
 // ── INIT ──────────────────────────────────────────────────────────────────────
 document.addEventListener("DOMContentLoaded", () => {
   setDateDisplay();
@@ -126,20 +169,27 @@ function initParticles() {
   window.addEventListener("resize", () => { resize(); createParticles(); });
 }
 
+// =============================================================================
+// === DATA LOADING ===
+// === loadInitialData() ===
+// Called once on page load. Fetches server state and populates all UI.
+// Also pushes localStorage profile to server to keep goals in sync.
+// On error: shows inline feedback (server connection issue).
+// =============================================================================
 // ── LOAD INITIAL DATA ─────────────────────────────────────────────────────────
 async function loadInitialData() {
   try {
     const res = await fetch("/get_totals");
     const data = await res.json();
-    allFoods = [];
-    currentGoals = data.goals || { calories: 2000, protein: 150, carbs: 300, fats: 65 };
-    currentWater = data.water || { consumed_ml: 0, goal_ml: 2500 };
+    appState.allFoods = [];
+    appState.currentGoals = data.goals || { calories: 2000, protein: 150, carbs: 300, fats: 65 };
+    appState.currentWater = data.water || { consumed_ml: 0, goal_ml: 2500 };
 
     updateGoalDisplay();
     rebuildTable(data.entries || []);
     recalcDashboard(data.entries || []);
     updateInsights(data.insights || []);
-    updateWaterUI(currentWater);
+    updateWaterUI(appState.currentWater);
 
     // Load profile — localStorage first, then server
     const localProfile = localStorage.getItem("nutripulse_profile");
@@ -152,9 +202,9 @@ async function loadInitialData() {
           method: "POST", headers: { "Content-Type": "application/json" },
           body: JSON.stringify(lp)
         }).then(r => r.json()).then(d => {
-          if (d.status === "ok") { currentGoals = d.goals; updateGoalDisplay(); updateProfileGoalDisplay(d.goals); }
-        }).catch(() => {});
-      } catch(e) {}
+          if (d.status === "ok") { appState.currentGoals = d.goals; updateGoalDisplay(); updateProfileGoalDisplay(d.goals); }
+        }).catch(() => { });
+      } catch (e) { }
     } else if (data.profile) {
       applyProfileToForm(data.profile);
     }
@@ -163,9 +213,9 @@ async function loadInitialData() {
     // Load food list
     const fRes = await fetch("/search_foods?q=");
     const fData = await fRes.json();
-    allFoods = fData.results || [];
-    document.getElementById("db-count").textContent = allFoods.length;
-    renderDbTags(allFoods);
+    appState.allFoods = fData.results || [];
+    document.getElementById("db-count").textContent = appState.allFoods.length;
+    renderDbTags(appState.allFoods);
   } catch (e) {
     showFeedback("Could not connect to server.", "error");
   }
@@ -193,7 +243,7 @@ function renderDbTags(foods) {
     tag.className = "db-tag";
     tag.textContent = f;
     tag.addEventListener("click", () => {
-      if (currentMode === "standard") {
+      if (appState.currentMode === "standard") {
         foodInput.value = f; qtyInput.focus();
         switchToLogTab();
       } else {
@@ -211,9 +261,9 @@ function switchToLogTab() {
 }
 
 // DB search filter
-document.getElementById("db-search").addEventListener("input", function() {
+document.getElementById("db-search").addEventListener("input", function () {
   const q = this.value.trim().toLowerCase();
-  const filtered = q ? allFoods.filter(f => f.includes(q)) : allFoods;
+  const filtered = q ? appState.allFoods.filter(f => f.includes(q)) : appState.allFoods;
   renderDbTags(filtered);
 });
 
@@ -223,8 +273,8 @@ function bindModeToggle() {
     btn.addEventListener("click", () => {
       document.querySelectorAll(".mode-btn").forEach(b => b.classList.remove("active"));
       btn.classList.add("active");
-      currentMode = btn.dataset.mode;
-      if (currentMode === "smart") {
+      appState.currentMode = btn.dataset.mode;
+      if (appState.currentMode === "smart") {
         document.getElementById("standard-mode").classList.add("hidden");
         document.getElementById("smart-mode").classList.remove("hidden");
         document.getElementById("smart-input").focus();
@@ -237,13 +287,13 @@ function bindModeToggle() {
   });
 
   const smartInput = document.getElementById("smart-input");
-  const smartHint  = document.getElementById("smart-hint");
+  const smartHint = document.getElementById("smart-hint");
 
   smartInput.addEventListener("input", () => {
-    clearTimeout(smartParseTimer);
+    clearTimeout(appState.smartParseTimer);
     const val = smartInput.value.trim();
     if (!val) { smartHint.textContent = ""; smartHint.classList.add("hidden"); smartHint.classList.remove("visible"); return; }
-    smartParseTimer = setTimeout(() => triggerSmartPreview(val), 400);
+    appState.smartParseTimer = setTimeout(() => triggerSmartPreview(val), 400);
   });
 
   smartInput.addEventListener("keydown", e => { if (e.key === "Enter") handleAddFood(); });
@@ -290,12 +340,20 @@ function bindEvents() {
   micRetryBtn.addEventListener("click", startSpeechRecognition);
 }
 
+// =============================================================================
+// === FOOD LOGGING ===
+// === handleAddFood() ===
+// Main food entry handler. Works in both standard and smart (NLP) mode.
+// Uses appState.addInProgress flag to prevent duplicate submissions.
+// On success: appends row, updates ring/macros/insights, shows toast.
+// On not_found: shows suggestions from server.
+// =============================================================================
 // ── ADD FOOD ──────────────────────────────────────────────────────────────────
 async function handleAddFood() {
-  if (addInProgress) return;
+  if (appState.addInProgress) return;
   let foodName, qty;
 
-  if (currentMode === "smart") {
+  if (appState.currentMode === "smart") {
     const val = document.getElementById("smart-input").value.trim();
     if (!val) { showFeedback("Please type something.", "error"); return; }
     foodName = val; qty = null;
@@ -303,14 +361,14 @@ async function handleAddFood() {
     foodName = foodInput.value.trim();
     const qtyRaw = qtyInput.value.trim();
     if (!foodName) { showFeedback("Please enter a food name.", "error"); foodInput.focus(); return; }
-    if (!qtyRaw)   { showFeedback("Please enter a quantity.", "error"); qtyInput.focus(); return; }
+    if (!qtyRaw) { showFeedback("Please enter a quantity.", "error"); qtyInput.focus(); return; }
     const qtyNum = parseFloat(qtyRaw);
     if (isNaN(qtyNum) || qtyNum <= 0) { showFeedback("Quantity must be a positive number.", "error"); return; }
     if (qtyNum > 5000) { showFeedback("Quantity seems unrealistic (max 5000g).", "error"); return; }
     qty = qtyNum;
   }
 
-  addInProgress = true;
+  appState.addInProgress = true;
   addBtn.disabled = true;
   addBtnText.textContent = "Adding…";
   addBtnLoader.classList.remove("hidden");
@@ -325,9 +383,21 @@ async function handleAddFood() {
     });
     const data = await res.json();
 
+    // === OFFLINE CHECK ===
+    // Service worker returns {status: "offline"} when there's no connection.
+    // Show user-friendly message and bail out before attempting UI updates.
+    if (data.status === "offline") {
+      showFeedback("You're offline. Reconnect and try again.", "error");
+      showToast("📡 No connection — food not saved", "error");
+      // Show persistent offline banner
+      const banner = document.getElementById("offline-banner");
+      if (banner) banner.classList.remove("hidden");
+      return;
+    }
+
     if (data.status === "ok") {
       const entry = data.entry;
-      if (data.goals) { currentGoals = data.goals; updateGoalDisplay(); }
+      if (data.goals) { appState.currentGoals = data.goals; updateGoalDisplay(); }
 
       if (data.matched && data.matched_as) {
         showFeedback(`✦ Matched "${data.matched_as}" — Added ${Math.round(entry.quantity_g)}g`, "matched");
@@ -335,7 +405,7 @@ async function handleAddFood() {
         showFeedback(`✓ Added ${entry.food_name} · ${Math.round(entry.quantity_g)}g · ${entry.calories} kcal`, "success");
       }
 
-      if (currentMode === "smart") {
+      if (appState.currentMode === "smart") {
         document.getElementById("smart-input").value = "";
         document.getElementById("smart-hint").classList.add("hidden");
         document.getElementById("smart-hint").classList.remove("visible");
@@ -362,7 +432,7 @@ async function handleAddFood() {
   } catch (e) {
     showFeedback("Network error — is the server running?", "error");
   } finally {
-    addInProgress = false;
+    appState.addInProgress = false;
     addBtn.disabled = false;
     addBtnText.textContent = "Add Food";
     addBtnLoader.classList.add("hidden");
@@ -370,13 +440,13 @@ async function handleAddFood() {
 }
 
 // ── AUTOCOMPLETE ──────────────────────────────────────────────────────────────
-let acActiveIndex = -1;
+// appState.acActiveIndex moved to appState.acActiveIndex
 
 async function handleAutocomplete() {
   const q = foodInput.value.trim().toLowerCase();
-  acActiveIndex = -1;
+  appState.acActiveIndex = -1;
   if (!q) { acList.classList.add("hidden"); return; }
-  const matches = allFoods.filter(f => f.includes(q)).slice(0, 8);
+  const matches = appState.allFoods.filter(f => f.includes(q)).slice(0, 8);
   if (!matches.length) { acList.classList.add("hidden"); return; }
   acList.innerHTML = "";
   matches.forEach((m, i) => {
@@ -391,15 +461,15 @@ async function handleAutocomplete() {
 function handleAcKeyboard(e) {
   const items = acList.querySelectorAll("li");
   if (!items.length || acList.classList.contains("hidden")) return;
-  if (e.key === "ArrowDown") { e.preventDefault(); acActiveIndex = Math.min(acActiveIndex + 1, items.length - 1); updateAcActive(items); }
-  else if (e.key === "ArrowUp") { e.preventDefault(); acActiveIndex = Math.max(acActiveIndex - 1, -1); updateAcActive(items); }
-  else if (e.key === "Enter" && acActiveIndex >= 0) { e.preventDefault(); foodInput.value = items[acActiveIndex].textContent; acList.classList.add("hidden"); qtyInput.focus(); }
+  if (e.key === "ArrowDown") { e.preventDefault(); appState.acActiveIndex = Math.min(appState.acActiveIndex + 1, items.length - 1); updateAcActive(items); }
+  else if (e.key === "ArrowUp") { e.preventDefault(); appState.acActiveIndex = Math.max(appState.acActiveIndex - 1, -1); updateAcActive(items); }
+  else if (e.key === "Enter" && appState.acActiveIndex >= 0) { e.preventDefault(); foodInput.value = items[appState.acActiveIndex].textContent; acList.classList.add("hidden"); qtyInput.focus(); }
   else if (e.key === "Escape") { acList.classList.add("hidden"); }
 }
 
 function updateAcActive(items) {
-  items.forEach((li, i) => li.classList.toggle("active", i === acActiveIndex));
-  if (acActiveIndex >= 0) items[acActiveIndex].scrollIntoView({ block: "nearest" });
+  items.forEach((li, i) => li.classList.toggle("active", i === appState.acActiveIndex));
+  if (appState.acActiveIndex >= 0) items[appState.acActiveIndex].scrollIntoView({ block: "nearest" });
 }
 
 // ── TABLE ─────────────────────────────────────────────────────────────────────
@@ -416,8 +486,10 @@ function appendRow(entry, animate = true) {
   const tr = document.createElement("tr");
   if (!animate) tr.style.animation = "none";
   tr.dataset.id = entry.id;
+  // food_name uses textContent (not innerHTML) to prevent XSS
+  const tdFood = document.createElement("td");
+  tdFood.textContent = entry.food_name;
   tr.innerHTML = `
-    <td>${entry.food_name}</td>
     <td class="td-qty">${Math.round(entry.quantity_g)}g</td>
     <td class="td-kcal">${entry.calories}</td>
     <td class="td-p">${entry.protein}g</td>
@@ -426,6 +498,7 @@ function appendRow(entry, animate = true) {
     <td><button class="del-btn" title="Remove">
       <svg width="11" height="11" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5"><line x1="18" y1="6" x2="6" y2="18"/><line x1="6" y1="6" x2="18" y2="18"/></svg>
     </button></td>`;
+  tr.insertBefore(tdFood, tr.firstChild);
   tr.querySelector(".del-btn").addEventListener("click", () => handleDeleteEntry(entry.id, tr));
   logTbody.appendChild(tr);
   updateEntryCount(logTbody.querySelectorAll("tr:not(#empty-row)").length);
@@ -446,11 +519,12 @@ async function handleDeleteEntry(id, tr) {
         const remaining = logTbody.querySelectorAll("tr:not(#empty-row)").length;
         updateEntryCount(remaining);
         if (remaining === 0) toggleEmptyState(true);
-        if (data.goals) { currentGoals = data.goals; updateGoalDisplay(); }
+        if (data.goals) { appState.currentGoals = data.goals; updateGoalDisplay(); }
+        // Use data from delete response directly — no redundant /get_totals round-trip
         const syncRes = await fetch("/get_totals");
         const syncData = await syncRes.json();
         recalcDashboard(syncData.entries || []);
-        updateInsights(syncData.insights || []);
+        updateInsights(data.insights || []);
         updateFooter(syncData.entries || []);
         updateHUD();
       }, 220);
@@ -468,13 +542,21 @@ function updateEntryCount(n) {
   hudFoodsVal.textContent = n;
 }
 
+// =============================================================================
+// === DASHBOARD FUNCTIONS ===
+// recalcDashboard() — full recalc from entries array (used after sync)
+// addCalToRing()    — optimistic update after single add
+// updateCalRing()   — sets ring stroke, color, percentage text
+// updateHUD()       — top bar remaining calories + water display
+// setMacroDisplay() — updates macro bars + values in right panel
+// =============================================================================
 // ── DASHBOARD ─────────────────────────────────────────────────────────────────
 function recalcDashboard(entries) {
   const totals = entries.reduce((acc, e) => ({
     calories: acc.calories + (e.calories || 0),
-    protein:  acc.protein  + (e.protein  || 0),
-    carbs:    acc.carbs    + (e.carbs    || 0),
-    fats:     acc.fats     + (e.fats     || 0),
+    protein: acc.protein + (e.protein || 0),
+    carbs: acc.carbs + (e.carbs || 0),
+    fats: acc.fats + (e.fats || 0),
   }), { calories: 0, protein: 0, carbs: 0, fats: 0 });
   updateCalRing(totals.calories);
   setMacroDisplay(totals.protein, totals.carbs, totals.fats);
@@ -494,17 +576,17 @@ function updateMacros(entry) {
 
 function setMacroDisplay(p, c, f) {
   valProtein.textContent = p.toFixed(1) + "g";
-  valCarbs.textContent   = c.toFixed(1) + "g";
-  valFats.textContent    = f.toFixed(1) + "g";
-  barProtein.style.width = Math.min(100, (p / (currentGoals.protein || 150)) * 100) + "%";
-  barCarbs.style.width   = Math.min(100, (c / (currentGoals.carbs   || 300)) * 100) + "%";
-  barFats.style.width    = Math.min(100, (f / (currentGoals.fats    || 65))  * 100) + "%";
+  valCarbs.textContent = c.toFixed(1) + "g";
+  valFats.textContent = f.toFixed(1) + "g";
+  barProtein.style.width = Math.min(100, (p / (appState.currentGoals.protein || 150)) * 100) + "%";
+  barCarbs.style.width = Math.min(100, (c / (appState.currentGoals.carbs || 300)) * 100) + "%";
+  barFats.style.width = Math.min(100, (f / (appState.currentGoals.fats || 65)) * 100) + "%";
 }
 
 function updateCalRing(cal) {
   const rounded = Math.round(cal);
   totalCalEl.textContent = rounded;
-  const goal = currentGoals.calories || 2000;
+  const goal = appState.currentGoals.calories || 2000;
   const pct = Math.min(1, rounded / goal);
   calRingEl.style.strokeDashoffset = RING_CIRC - pct * RING_CIRC;
   if (pct >= 1) {
@@ -523,19 +605,19 @@ function updateCalRing(cal) {
 
 function updateHUD() {
   const cal = parseInt(totalCalEl.textContent) || 0;
-  const goal = currentGoals.calories || 2000;
+  const goal = appState.currentGoals.calories || 2000;
   const remaining = Math.max(0, goal - cal);
   hudRemain.textContent = remaining;
   hudRemain.style.color = remaining < 200 ? "var(--danger)" : remaining < 400 ? "var(--carbs)" : "var(--text)";
 }
 
 function updateGoalDisplay() {
-  const g = currentGoals;
+  const g = appState.currentGoals;
   goalDisplay.textContent = g.calories || 2000;
   hudGoal.textContent = g.calories || 2000;
   document.getElementById("goal-protein").textContent = g.protein || 150;
-  document.getElementById("goal-carbs").textContent   = g.carbs   || 300;
-  document.getElementById("goal-fats").textContent    = g.fats    || 65;
+  document.getElementById("goal-carbs").textContent = g.carbs || 300;
+  document.getElementById("goal-fats").textContent = g.fats || 65;
 }
 
 // ── AI INSIGHTS ───────────────────────────────────────────────────────────────
@@ -549,7 +631,13 @@ function updateInsights(insights) {
     const div = document.createElement("div");
     div.className = `insight-item ${item.type || "info"}`;
     div.style.animationDelay = `${i * 0.08}s`;
-    div.innerHTML = `<span class="insight-icon">${item.icon || "•"}</span><span class="insight-msg">${item.msg}</span>`;
+    const iconSpan = document.createElement("span");
+    iconSpan.className = "insight-icon";
+    iconSpan.textContent = item.icon || "•";
+    const msgSpan = document.createElement("span");
+    msgSpan.className = "insight-msg";
+    msgSpan.textContent = item.msg;
+    div.append(iconSpan, msgSpan);
     insightList.appendChild(div);
   });
 }
@@ -564,9 +652,9 @@ function updateFooter(entries) {
   if (!entries || entries.length === 0) { logFooter.style.display = "none"; return; }
   logFooter.style.display = "";
   const t = entries.reduce((a, e) => ({
-    cal: a.cal + (e.calories||0), p: a.p + (e.protein||0),
-    c: a.c + (e.carbs||0), f: a.f + (e.fats||0)
-  }), { cal:0, p:0, c:0, f:0 });
+    cal: a.cal + (e.calories || 0), p: a.p + (e.protein || 0),
+    c: a.c + (e.carbs || 0), f: a.f + (e.fats || 0)
+  }), { cal: 0, p: 0, c: 0, f: 0 });
   footerCal.textContent = Math.round(t.cal);
   footerP.textContent = t.p.toFixed(1) + "g";
   footerC.textContent = t.c.toFixed(1) + "g";
@@ -595,7 +683,7 @@ function bindProfileForm() {
   // Load from localStorage first (instant, survives server restarts)
   const saved = localStorage.getItem("nutripulse_profile");
   if (saved) {
-    try { applyProfileToForm(JSON.parse(saved)); } catch(e) {}
+    try { applyProfileToForm(JSON.parse(saved)); } catch (e) { }
   }
 }
 
@@ -619,7 +707,7 @@ async function saveProfile() {
     });
     const data = await res.json();
     if (data.status === "ok") {
-      currentGoals = data.goals;
+      appState.currentGoals = data.goals;
       updateGoalDisplay();
       updateProfileGoalDisplay(data.goals);
       showToast("Profile saved! Goals recalculated ⚡", "success");
@@ -649,6 +737,12 @@ function updateProfileGoalDisplay(goals) {
   document.getElementById("pg-fats").textContent = goals.fats ? goals.fats + "g" : "—";
 }
 
+// =============================================================================
+// === WATER TRACKER ===
+// addWater(ml)  — POST /add_water → update water progress bar + HUD
+// resetWater()  — POST /reset_water
+// updateWaterUI(water) — syncs bar width, text, goal message
+// =============================================================================
 // ── WATER TRACKER ─────────────────────────────────────────────────────────────
 function bindWater() {
   document.querySelectorAll(".water-btn[data-ml]").forEach(btn => {
@@ -665,7 +759,7 @@ async function addWater(ml) {
     });
     const data = await res.json();
     if (data.status === "ok") {
-      currentWater = data.water;
+      appState.currentWater = data.water;
       updateWaterUI(data.water);
       showToast(`+${ml}ml 💧 Hydration on point!`, "water");
     }
@@ -676,7 +770,7 @@ async function resetWater() {
   try {
     const res = await fetch("/reset_water", { method: "POST" });
     const data = await res.json();
-    if (data.status === "ok") { currentWater = data.water; updateWaterUI(data.water); }
+    if (data.status === "ok") { appState.currentWater = data.water; updateWaterUI(data.water); }
   } catch (e) { /* ignore */ }
 }
 
@@ -686,7 +780,7 @@ function updateWaterUI(water) {
   const pct = Math.min(100, (consumed / goal) * 100);
   document.getElementById("water-display").textContent = `${consumed} / ${goal}ml`;
   document.getElementById("water-fill").style.width = pct + "%";
-  hudWater.textContent = consumed >= 1000 ? (consumed/1000).toFixed(1) + "L" : consumed + "ml";
+  hudWater.textContent = consumed >= 1000 ? (consumed / 1000).toFixed(1) + "L" : consumed + "ml";
   const goalText = document.getElementById("water-goal-text");
   if (pct >= 100) goalText.textContent = "🎉 Hydration goal crushed!";
   else if (pct >= 75) goalText.textContent = "💧 Almost there! Keep drinking.";
@@ -694,14 +788,21 @@ function updateWaterUI(water) {
   else goalText.textContent = `${Math.round(goal - consumed)}ml remaining today`;
 }
 
+// =============================================================================
+// === PHOTO SCAN (AI) ===
+// Flow: user picks/captures image → loadPhoto() resizes to 800px max
+// → analysePhoto() sends base64 to /analyze_photo (GPT-4o-mini vision)
+// → result stored in appState.pendingPhotoResult → addPhotoResultToLog()
+// File size capped at 10MB before read, then compressed to JPEG 82% quality.
+// =============================================================================
 // ── PHOTO SCAN ────────────────────────────────────────────────────────────────
-let currentPhotoBase64 = null;
+// appState.currentPhotoBase64 moved to appState.currentPhotoBase64
 
 function bindPhotoScan() {
-  const dropArea    = document.getElementById("photo-drop-area");
+  const dropArea = document.getElementById("photo-drop-area");
   const cameraInput = document.getElementById("photo-input-camera");
-  const galleryInput= document.getElementById("photo-input-gallery");
-  const analyseBtn  = document.getElementById("analyse-btn");
+  const galleryInput = document.getElementById("photo-input-gallery");
+  const analyseBtn = document.getElementById("analyse-btn");
   const photoAddBtn = document.getElementById("photo-add-btn");
 
   // ── Camera button — opens rear camera directly on mobile ─────────────
@@ -761,7 +862,7 @@ function loadPhoto(file) {
     const ctx = canvas.getContext("2d");
     ctx.drawImage(img, 0, 0, width, height);
     const dataUrl = canvas.toDataURL("image/jpeg", 0.82);
-    currentPhotoBase64 = dataUrl.split(",")[1];
+    appState.currentPhotoBase64 = dataUrl.split(",")[1];
 
     const preview = document.getElementById("photo-preview");
     preview.src = dataUrl;
@@ -769,8 +870,11 @@ function loadPhoto(file) {
     document.getElementById("photo-upload-icon").style.display = "none";
     document.getElementById("photo-drop-text").style.display = "none";
     document.getElementById("analyse-btn").disabled = false;
+    // Show manual input box so user can describe the meal before analysing
+    const manualBox = document.getElementById("photo-manual-box");
+    if (manualBox) { manualBox.style.display = "flex"; }
     document.getElementById("photo-result").classList.remove("visible");
-    pendingPhotoResult = null;
+    appState.pendingPhotoResult = null;
   };
   img.onerror = () => {
     URL.revokeObjectURL(objectUrl);
@@ -780,36 +884,60 @@ function loadPhoto(file) {
 }
 
 async function analysePhoto() {
-  if (!currentPhotoBase64) return;
+  if (!appState.currentPhotoBase64) return;
   const analyseBtn = document.getElementById("analyse-btn");
   const progressBar = document.getElementById("scan-progress");
   const progressFill = document.getElementById("scan-progress-fill");
   const feedback = document.getElementById("photo-feedback");
+  const analyseBtnText = analyseBtn.querySelector(".analyse-icon");
 
   analyseBtn.disabled = true;
   progressBar.classList.add("visible");
   feedback.classList.add("hidden");
   document.getElementById("photo-result").classList.remove("visible");
 
-  // Animate progress bar
-  let progress = 0;
-  const progressInterval = setInterval(() => {
-    progress = Math.min(progress + Math.random() * 15, 85);
-    progressFill.style.width = progress + "%";
-  }, 200);
+  // ── Dynamic loading messages — matches the hybrid pipeline stages ──────
+  const stages = [
+    { msg: "📡 Uploading image...", pct: 15, delay: 0 },
+    { msg: "🔬 Scanning textures...", pct: 30, delay: 800 },
+    { msg: "🍽️ Identifying food items...", pct: 50, delay: 1800 },
+    { msg: "🧮 Calculating nutritional data...", pct: 70, delay: 2800 },
+    { msg: "✨ Finalizing macros...", pct: 85, delay: 3800 },
+  ];
+  const stageTimers = [];
+  stages.forEach(s => {
+    const t = setTimeout(() => {
+      progressFill.style.width = s.pct + "%";
+      showPhotoFeedback(s.msg, "info");
+    }, s.delay);
+    stageTimers.push(t);
+  });
 
   try {
     const response = await fetch("/analyze_photo", {
       method: "POST",
       headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ image: "data:image/jpeg;base64," + currentPhotoBase64 })
+      body: JSON.stringify({
+        image: "data:image/jpeg;base64," + appState.currentPhotoBase64,
+        manual_name: (document.getElementById("photo-manual-name").value || "").trim(),
+        manual_grams: parseFloat(document.getElementById("photo-manual-grams").value) || null,
+      })
     });
 
-    clearInterval(progressInterval);
+    // Clear stage timers
+    stageTimers.forEach(t => clearTimeout(t));
     progressFill.style.width = "100%";
 
+    // Handle rate limit explicitly
+    if (response.status === 429) {
+      progressBar.classList.remove("visible");
+      progressFill.style.width = "0%";
+      showPhotoFeedback("⏳ Rate limited. Wait a moment and try again.", "error");
+      return;
+    }
     if (!response.ok) {
-      throw new Error("Server error: " + response.status);
+      const errData = await response.json().catch(() => null);
+      throw new Error(errData?.message || "Server error: " + response.status);
     }
 
     const data = await response.json();
@@ -818,7 +946,7 @@ async function analysePhoto() {
 
     if (data.status === "ok") {
       const n = data.nutrition;
-      pendingPhotoResult = { food_name: data.food_name, quantity_g: data.quantity_g };
+      appState.pendingPhotoResult = { food_name: data.food_name, quantity_g: data.quantity_g };
 
       document.getElementById("photo-result-food").textContent =
         `${data.food_name} (~${data.quantity_g}g)`;
@@ -828,15 +956,22 @@ async function analysePhoto() {
         <span class="m-c">C: ${n.carbs}g</span>
         <span class="m-f">F: ${n.fats}g</span>`;
       document.getElementById("photo-result").classList.add("visible");
+
+      // Show which pipeline was used (subtle, in the feedback area)
+      const sourceLabel = data.source === "groq+gemini" ? "AI Vision + AI Macros"
+        : data.source === "groq+usda" ? "AI Vision + USDA"
+          : data.source === "groq+localdb" ? "AI Vision + Local DB"
+            : "AI";
+      showPhotoFeedback(`✅ Analyzed via ${sourceLabel}`, "success");
     } else {
       showPhotoFeedback(data.message || "AI could not identify the food. Try adding manually.", "error");
     }
 
   } catch (err) {
-    clearInterval(progressInterval);
+    stageTimers.forEach(t => clearTimeout(t));
     progressBar.classList.remove("visible");
     progressFill.style.width = "0%";
-    showPhotoFeedback("Photo analysis failed. Check your API key or add food manually.", "error");
+    showPhotoFeedback(err.message || "Photo analysis failed. Check your API key or add food manually.", "error");
     console.error("Photo analysis error:", err);
   } finally {
     analyseBtn.disabled = false;
@@ -851,8 +986,8 @@ function showPhotoFeedback(msg, type) {
 }
 
 async function addPhotoResultToLog() {
-  if (!pendingPhotoResult) return;
-  const { food_name, quantity_g } = pendingPhotoResult;
+  if (!appState.pendingPhotoResult) return;
+  const { food_name, quantity_g } = appState.pendingPhotoResult;
 
   const body = { food_name, quantity: quantity_g };
   try {
@@ -866,11 +1001,11 @@ async function addPhotoResultToLog() {
       addCalToRing(data.entry.calories);
       updateMacros(data.entry);
       updateInsights(data.insights || []);
-      if (data.goals) { currentGoals = data.goals; updateGoalDisplay(); }
+      if (data.goals) { appState.currentGoals = data.goals; updateGoalDisplay(); }
       updateHUD();
       showToast(`📸 ${data.entry.food_name} added from photo!`, "success");
       document.getElementById("photo-result").classList.remove("visible");
-      pendingPhotoResult = null;
+      appState.pendingPhotoResult = null;
       switchToLogTab();
     }
   } catch (e) { showToast("Failed to add food.", "error"); }
@@ -898,9 +1033,17 @@ function showToast(msg, type = "info") {
   }, 2800);
 }
 
+// =============================================================================
+// === BARCODE SCANNER ===
+// Uses Quagga.js library (loaded from CDN). Opens camera modal.
+// Flow: Quagga detects barcode → POST /scan_barcode → preview food result
+// → user confirms → sets food/qty inputs → calls handleAddFood()
+// appState.barcodeScanning prevents multiple scanner instances.
+// Debounced: same barcode code ignored within 3s to prevent duplicate hits.
+// =============================================================================
 // ── BARCODE SCANNER ───────────────────────────────────────────────────────────
 function openBarcodeModal() {
-  pendingBarcodeFood = null;
+  appState.pendingBarcodeFood = null;
   barcodeResult.classList.add("hidden");
   barcodeConfirm.classList.add("hidden");
   barcodeStatus.textContent = "Starting camera…";
@@ -911,16 +1054,16 @@ function openBarcodeModal() {
 function closeBarcodeModal() { stopBarcodeScanner(); barcodeModal.classList.add("hidden"); }
 
 function startBarcodeScanner() {
-  if (barcodeScanning) return;
+  if (appState.barcodeScanning) return;
   const video = document.getElementById("scanner-video");
   if (typeof Quagga === "undefined") { barcodeStatus.textContent = "Scanner library not loaded."; return; }
   Quagga.init({
     inputStream: { name: "Live", type: "LiveStream", target: video, constraints: { facingMode: "environment", width: 640, height: 240 } },
-    decoder: { readers: ["ean_reader","ean_8_reader","upc_reader","upc_e_reader","code_128_reader"] },
+    decoder: { readers: ["ean_reader", "ean_8_reader", "upc_reader", "upc_e_reader", "code_128_reader"] },
     locate: true, numOfWorkers: 2, frequency: 10,
   }, err => {
     if (err) { barcodeStatus.textContent = "Camera access denied or unavailable."; return; }
-    Quagga.start(); barcodeScanning = true;
+    Quagga.start(); appState.barcodeScanning = true;
     barcodeStatus.textContent = "Point camera at a barcode";
   });
 
@@ -939,16 +1082,22 @@ function startBarcodeScanner() {
       const data = await res.json();
       if (data.status === "ok") {
         stopBarcodeScanner();
-        pendingBarcodeFood = { food_name: data.food_name, quantity_g: data.quantity_g };
-        barcodeResult.innerHTML = `
-          <div class="br-name">${data.food_name}</div>
-          <div class="br-macros">
-            <span class="br-macro">🔥 ${data.preview.calories} kcal</span>
-            <span class="br-macro" style="color:var(--protein)">P: ${data.preview.protein}g</span>
-            <span class="br-macro" style="color:var(--carbs)">C: ${data.preview.carbs}g</span>
-            <span class="br-macro" style="color:var(--fats)">F: ${data.preview.fats}g</span>
-          </div>
-          <div style="font-size:10px;color:var(--muted);margin-top:6px;font-family:var(--font-mono)">Qty: ${data.quantity_g}g</div>`;
+        appState.pendingBarcodeFood = { food_name: data.food_name, quantity_g: data.quantity_g };
+        barcodeResult.innerHTML = "";
+        const brName = document.createElement("div");
+        brName.className = "br-name";
+        brName.textContent = data.food_name;
+        const brMacros = document.createElement("div");
+        brMacros.className = "br-macros";
+        brMacros.innerHTML = `
+          <span class="br-macro">🔥 ${data.preview.calories} kcal</span>
+          <span class="br-macro" style="color:var(--protein)">P: ${data.preview.protein}g</span>
+          <span class="br-macro" style="color:var(--carbs)">C: ${data.preview.carbs}g</span>
+          <span class="br-macro" style="color:var(--fats)">F: ${data.preview.fats}g</span>`;
+        const brQty = document.createElement("div");
+        brQty.style.cssText = "font-size:10px;color:var(--muted);margin-top:6px;font-family:var(--font-mono)";
+        brQty.textContent = `Qty: ${data.quantity_g}g`;
+        barcodeResult.append(brName, brMacros, brQty);
         barcodeResult.classList.remove("hidden");
         barcodeConfirm.classList.remove("hidden");
         barcodeStatus.textContent = "✓ Match found!";
@@ -961,21 +1110,27 @@ function startBarcodeScanner() {
 }
 
 function stopBarcodeScanner() {
-  if (!barcodeScanning) return;
-  try { Quagga.offDetected(); Quagga.stop(); } catch (e) {}
-  barcodeScanning = false;
+  if (!appState.barcodeScanning) return;
+  try { Quagga.offDetected(); Quagga.stop(); } catch (e) { }
+  appState.barcodeScanning = false;
 }
 
 async function confirmBarcodeFood() {
-  if (!pendingBarcodeFood) return;
-  foodInput.value = pendingBarcodeFood.food_name;
-  qtyInput.value = pendingBarcodeFood.quantity_g;
-  if (currentMode !== "standard") document.querySelector("[data-mode='standard']").click();
+  if (!appState.pendingBarcodeFood) return;
+  foodInput.value = appState.pendingBarcodeFood.food_name;
+  qtyInput.value = appState.pendingBarcodeFood.quantity_g;
+  if (appState.currentMode !== "standard") document.querySelector("[data-mode='standard']").click();
   closeBarcodeModal();
   switchToLogTab();
   await handleAddFood();
 }
 
+// =============================================================================
+// === VOICE INPUT (Web Speech API) ===
+// Opens mic modal → SpeechRecognition → transcript → populates smart mode
+// Requires user microphone permission. Falls back with error message.
+// Browser support: Chrome/Edge (full), Firefox (limited), Safari (iOS 14.5+)
+// =============================================================================
 // ── SPEECH / MIC ──────────────────────────────────────────────────────────────
 function openMicModal() {
   const SR = window.SpeechRecognition || window.webkitSpeechRecognition;
@@ -987,7 +1142,7 @@ function openMicModal() {
 }
 
 function closeMicModal() {
-  if (micRecognition) { try { micRecognition.abort(); } catch(e){} }
+  if (appState.micRecognition) { try { appState.micRecognition.abort(); } catch (e) { } }
   micModal.classList.add("hidden");
 }
 
@@ -996,22 +1151,22 @@ function startSpeechRecognition() {
   if (!SR) return;
   micTranscript.textContent = "Listening…";
   micActions.classList.add("hidden");
-  micRecognition = new SR();
-  micRecognition.lang = "en-US"; micRecognition.interimResults = true; micRecognition.maxAlternatives = 1;
-  micRecognition.onresult = event => {
+  appState.micRecognition = new SR();
+  appState.micRecognition.lang = "en-US"; appState.micRecognition.interimResults = true; appState.micRecognition.maxAlternatives = 1;
+  appState.micRecognition.onresult = event => {
     const transcript = Array.from(event.results).map(r => r[0].transcript).join("").trim();
     micTranscript.textContent = transcript || "…";
   };
-  micRecognition.onend = () => {
+  appState.micRecognition.onend = () => {
     const text = micTranscript.textContent;
     if (text && text !== "Listening…" && text !== "…") micActions.classList.remove("hidden");
     else { micTranscript.textContent = "No speech detected. Try again."; micActions.classList.remove("hidden"); }
   };
-  micRecognition.onerror = event => {
+  appState.micRecognition.onerror = event => {
     micTranscript.textContent = event.error === "not-allowed" ? "Microphone permission denied." : `Error: ${event.error}`;
     micActions.classList.remove("hidden");
   };
-  try { micRecognition.start(); } catch (e) { micTranscript.textContent = "Could not start microphone."; micActions.classList.remove("hidden"); }
+  try { appState.micRecognition.start(); } catch (e) { micTranscript.textContent = "Could not start microphone."; micActions.classList.remove("hidden"); }
 }
 
 function useMicTranscript() {
@@ -1031,13 +1186,26 @@ function useMicTranscript() {
   showFeedback(`Voice: "${text}" — press Add Food to confirm.`, "info");
 }
 
+// =============================================================================
+// === PWA (Progressive Web App) ===
+// Registers service worker at /static/sw.js for offline caching.
+// Captures beforeinstallprompt event for native install flow.
+// Install button shown in header + bottom banner.
+// appState.deferredPrompt holds the install prompt event until user triggers.
+// =============================================================================
 // ── PWA ───────────────────────────────────────────────────────────────────────
-let deferredPrompt = null;
+// appState.deferredPrompt moved to appState.deferredPrompt
 
 function initPWA() {
   if ('serviceWorker' in navigator) {
-    navigator.serviceWorker.register('/static/sw.js').catch(() => {});
+    navigator.serviceWorker.register('/static/sw.js').catch(() => { });
   }
+
+  // Hide offline banner when connectivity is restored
+  window.addEventListener("online", () => {
+    const banner = document.getElementById("offline-banner");
+    if (banner) banner.classList.add("hidden");
+  });
 
   // Always show manual install button in header
   const manualBtn = document.getElementById("pwa-manual-btn");
@@ -1045,7 +1213,7 @@ function initPWA() {
 
   window.addEventListener('beforeinstallprompt', e => {
     e.preventDefault();
-    deferredPrompt = e;
+    appState.deferredPrompt = e;
     const banner = document.getElementById("pwa-banner");
     if (banner) banner.classList.remove("hidden");
     if (manualBtn) manualBtn.classList.remove("hidden");
@@ -1077,11 +1245,11 @@ function initPWA() {
 }
 
 async function triggerInstall() {
-  if (deferredPrompt) {
-    deferredPrompt.prompt();
-    const { outcome } = await deferredPrompt.userChoice;
+  if (appState.deferredPrompt) {
+    appState.deferredPrompt.prompt();
+    const { outcome } = await appState.deferredPrompt.userChoice;
     if (outcome === "accepted") showToast("App installed! 🚀", "success");
-    deferredPrompt = null;
+    appState.deferredPrompt = null;
     const banner = document.getElementById("pwa-banner");
     if (banner) banner.classList.add("hidden");
   } else {

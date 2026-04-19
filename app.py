@@ -1,4 +1,35 @@
+# =============================================================================
+# NutriPulse — Flask Backend (app.py)
+# =============================================================================
+# === AI SYSTEM GUIDE ===
+# This file is the full Flask backend for NutriPulse, an AI nutrition tracker.
+#
+# === DATA FLOW ===
+# Frontend → API route → match/parse food → session storage → JSON response → UI update
+#
+# === RESPONSE CONTRACT ===
+# All routes return: {"status": "ok" | "error" | "not_found", ...payload}
+# Frontend relies on this contract — do NOT change status strings.
+#
+# === KEY MODULES ===
+# NUTRITION_DB       — per-100g local nutrition dictionary (fast, no API cost)
+# _fuzzy_match()     — multi-stage fuzzy food lookup (exact → alias → prefix → trigram)
+# _calc_goals()      — Mifflin-St Jeor BMR + TDEE → macros per user profile
+# _local_ai_feedback()— rule-based insight engine (no AI cost for basic feedback)
+# _query_usda()      — USDA FoodData Central fallback for unknown foods
+# analyze_photo      — HYBRID: Groq Vision (identify) → Groq Text (macros)
+#
+# === IMPORTANT: MODIFYING THIS FILE ===
+# 1. Maintain the response JSON structure (frontend depends on it)
+# 2. All nutrition values are per 100g — use _scale() to adjust for quantity
+# 3. Rate limits are applied on expensive/API routes — don't remove them
+# 4. SECRET_KEY must always come from environment — never hardcode fallbacks
+# =============================================================================
+
+import logging
 from flask import Flask, request, jsonify, render_template, session
+from flask_limiter import Limiter
+from flask_limiter.util import get_remote_address
 import uuid
 import re
 import base64
@@ -10,22 +41,58 @@ import requests
 
 load_dotenv()
 
-# OpenAI
-openai_client = OpenAI(api_key=os.getenv("OPENAI_API_KEY"))
+logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
+logger = logging.getLogger(__name__)
 
-# USDA — used inline in route:
-# requests.get(f"https://api.nal.usda.gov/fdc/v1/foods/search?query={q}&api_key={os.getenv('USDA_API_KEY')}")
+# === EXTERNAL CLIENTS ===
+# Groq — free API used for BOTH vision (Step 1) and macro text (Step 2)
+# Get free key at console.groq.com — no billing required, 30 RPM free tier
+GROQ_API_KEY = os.getenv("GROQ_API_KEY")
+groq_client = OpenAI(
+    api_key=GROQ_API_KEY,
+    base_url="https://api.groq.com/openai/v1"
+) if GROQ_API_KEY else None
+
+# USDA FoodData Central — fallback when food not in local NUTRITION_DB
 USDA_API_KEY = os.getenv("USDA_API_KEY")
 
 app = Flask(__name__)
-app.secret_key = os.getenv("SECRET_KEY", "nutripulse_ultra_v2_2024_xk9q")
+
+# === SECURITY: SECRET KEY ===
+# Must be set in environment — no hardcoded fallback in production
+_secret = os.getenv("SECRET_KEY")
+if not _secret:
+    raise RuntimeError(
+        "SECRET_KEY environment variable is not set. "
+        "Generate one with: python -c \"import secrets; print(secrets.token_hex(32))\""
+    )
+app.secret_key = _secret
+
+# === SESSION CONFIG ===
+IS_PROD = os.getenv("FLASK_ENV", "development") == "production"
 app.config["SESSION_COOKIE_SAMESITE"] = "Lax"
-app.config["SESSION_COOKIE_SECURE"] = False  # set True if HTTPS only
+app.config["SESSION_COOKIE_SECURE"] = IS_PROD  # True on HTTPS in production
+app.config["SESSION_COOKIE_HTTPONLY"] = True
 app.config["PERMANENT_SESSION_LIFETIME"] = 86400 * 30  # 30 days
 
+# === RATE LIMITING ===
+# Protects Groq + USDA API endpoints from abuse / cost explosion
+limiter = Limiter(
+    get_remote_address,
+    app=app,
+    default_limits=["500 per day", "100 per hour"],
+    storage_uri="memory://",
+)
 
 
-# ─── COMPREHENSIVE NUTRITION DATASET (per 100g) ──────────────────────────────
+
+# =============================================================================
+# === DATA LAYER: LOCAL NUTRITION DATABASE ===
+# All values are per 100g of the food item.
+# Lookup order: NUTRITION_DB → FOOD_ALIASES → _fuzzy_match → USDA API → AI
+# To add foods: add key (lowercase) + {calories, protein, carbs, fats} dict.
+# =============================================================================
+
 NUTRITION_DB = {
     "apple":              {"calories": 52,  "protein": 0.3,  "carbs": 14.0, "fats": 0.2},
     "banana":             {"calories": 89,  "protein": 1.1,  "carbs": 23.0, "fats": 0.3},
@@ -92,6 +159,28 @@ NUTRITION_DB = {
     "orange juice":       {"calories": 45,  "protein": 0.7,  "carbs": 10.0, "fats": 0.2},
     "coffee":             {"calories": 2,   "protein": 0.3,  "carbs": 0.0,  "fats": 0.0},
     "green tea":          {"calories": 1,   "protein": 0.2,  "carbs": 0.0,  "fats": 0.0},
+    # Indian foods
+    "dosa":               {"calories": 168, "protein": 3.9,  "carbs": 30.0, "fats": 3.7},
+    "idli":               {"calories": 58,  "protein": 2.0,  "carbs": 11.0, "fats": 0.4},
+    "sambar":             {"calories": 55,  "protein": 3.0,  "carbs": 8.0,  "fats": 1.5},
+    "chutney":            {"calories": 80,  "protein": 2.0,  "carbs": 8.0,  "fats": 4.5},
+    "rice":               {"calories": 130, "protein": 2.7,  "carbs": 28.0, "fats": 0.3},
+    "dal":                {"calories": 116, "protein": 9.0,  "carbs": 20.0, "fats": 0.4},
+    "roti":               {"calories": 297, "protein": 9.0,  "carbs": 56.0, "fats": 3.7},
+    "chapati":            {"calories": 297, "protein": 9.0,  "carbs": 56.0, "fats": 3.7},
+    "biryani":            {"calories": 163, "protein": 5.5,  "carbs": 25.0, "fats": 5.0},
+    "paneer":             {"calories": 265, "protein": 18.0, "carbs": 3.4,  "fats": 20.0},
+    "palak paneer":       {"calories": 137, "protein": 7.5,  "carbs": 5.0,  "fats": 10.0},
+    "butter chicken":     {"calories": 150, "protein": 12.0, "carbs": 6.0,  "fats": 9.0},
+    "naan":               {"calories": 310, "protein": 9.0,  "carbs": 55.0, "fats": 6.0},
+    "upma":               {"calories": 145, "protein": 3.5,  "carbs": 22.0, "fats": 5.0},
+    "poha":               {"calories": 130, "protein": 2.5,  "carbs": 27.0, "fats": 2.0},
+    "vada":               {"calories": 290, "protein": 8.0,  "carbs": 35.0, "fats": 14.0},
+    "uttapam":            {"calories": 145, "protein": 4.5,  "carbs": 26.0, "fats": 3.0},
+    "pongal":             {"calories": 150, "protein": 4.0,  "carbs": 25.0, "fats": 4.5},
+    "rasam":              {"calories": 30,  "protein": 1.5,  "carbs": 5.0,  "fats": 0.5},
+    "curd rice":          {"calories": 120, "protein": 3.5,  "carbs": 22.0, "fats": 2.0},
+    "masala dosa":        {"calories": 210, "protein": 5.0,  "carbs": 35.0, "fats": 6.5},
 }
 
 # ─── UNIT CONVERSION ────────────────────────────────────────────────────────
@@ -121,6 +210,7 @@ FOOD_ALIASES = {
     "porridge": "oats", "spaghetti": "pasta", "noodles": "pasta", "nuts": "almonds",
     "peanuts": "almonds", "turkey": "chicken breast", "taters": "sweet potato",
     "prot": "whey protein", "protein powder": "whey protein", "shake": "whey protein",
+    "dosai": "dosa", "thosai": "dosa", "idly": "idli", "sambhar": "sambar",
 }
 
 BARCODE_DB = {
@@ -133,7 +223,6 @@ BARCODE_DB = {
     "011110038364": {"name": "brown rice bag",    "food": "brown rice",       "quantity_g": 100},
 }
 
-# ─── PHOTO ANALYSIS - LOCAL FALLBACK ────────────────────────────────────────
 PHOTO_FOOD_KEYWORDS = {
     "pizza": "pizza", "burger": "burger", "salad": "spinach", "chicken": "chicken breast",
     "rice": "white rice", "pasta": "pasta", "egg": "egg", "banana": "banana",
@@ -142,8 +231,14 @@ PHOTO_FOOD_KEYWORDS = {
     "avocado": "avocado", "oatmeal": "oats", "yogurt": "greek yogurt",
     "chocolate": "dark chocolate", "nuts": "almonds", "fries": "french fries",
     "sushi": "tuna", "toast": "whole wheat bread", "smoothie": "banana",
+    "dosa": "dosa", "idli": "idli", "sambar": "sambar", "roti": "roti",
+    "biryani": "biryani", "paneer": "paneer", "naan": "naan",
 }
 
+
+# =============================================================================
+# === HELPER FUNCTIONS ===
+# =============================================================================
 
 def _scale(nutrient_val, quantity_g):
     return round(nutrient_val * quantity_g / 100, 1)
@@ -172,7 +267,6 @@ def _get_water():
 
 
 def _calc_goals(profile):
-    """Mifflin-St Jeor BMR + TDEE"""
     gender = profile.get("gender", "male")
     age = float(profile.get("age", 25))
     h = float(profile.get("height_cm", 175))
@@ -197,7 +291,11 @@ def _calc_goals(profile):
     else:
         cal_goal = tdee
 
-    cal_goal = max(1200, round(cal_goal))
+    # Manual override — user knows their body better than the formula
+    if profile.get("custom_calories"):
+        cal_goal = int(profile["custom_calories"])
+    else:
+        cal_goal = max(1200, round(cal_goal))
     protein_goal = round(w * 1.8)
     carbs_goal = round((cal_goal * 0.45) / 4)
     fats_goal = round((cal_goal * 0.25) / 9)
@@ -326,7 +424,10 @@ def _local_ai_feedback(entries, goals):
     return insights[:4]
 
 
-# ─── ROUTES ──────────────────────────────────────────────────────────────────
+# =============================================================================
+# === ROUTES ===
+# =============================================================================
+
 @app.route("/")
 def index():
     session.permanent = True
@@ -344,6 +445,7 @@ def get_totals():
 
 
 @app.route("/add_food", methods=["POST"])
+@limiter.limit("60 per minute")
 def add_food():
     data = request.get_json(silent=True)
     if not data:
@@ -373,7 +475,7 @@ def add_food():
         return jsonify({"status": "not_found", "message": f'"{food_name}" not found.', "suggestions": suggestions}), 404
     nd = NUTRITION_DB[matched_key]
     entry = {
-        "id": str(uuid.uuid4())[:8],
+        "id": str(uuid.uuid4()),
         "food_name": matched_key.title(),
         "quantity_g": round(quantity, 1),
         "calories": _scale(nd["calories"], quantity),
@@ -462,6 +564,7 @@ def search_foods():
 
 
 @app.route("/parse_input", methods=["POST"])
+@limiter.limit("120 per minute")
 def parse_input():
     data = request.get_json(silent=True)
     if not data:
@@ -480,6 +583,13 @@ def update_profile():
     data = request.get_json(silent=True)
     if not data:
         return jsonify({"status": "error"}), 400
+    custom_cal = data.get("custom_calories")
+    try:
+        custom_cal = int(custom_cal) if custom_cal else None
+        if custom_cal and (custom_cal < 500 or custom_cal > 10000):
+            custom_cal = None
+    except (ValueError, TypeError):
+        custom_cal = None
     profile = {
         "gender": data.get("gender", "male"),
         "age": max(10, min(100, int(data.get("age", 25)))),
@@ -487,6 +597,7 @@ def update_profile():
         "weight_kg": max(30, min(300, float(data.get("weight_kg", 70)))),
         "activity": data.get("activity", "moderate"),
         "goal": data.get("goal", "maintain"),
+        "custom_calories": custom_cal,
     }
     session["user_profile"] = profile
     session.modified = True
@@ -517,7 +628,6 @@ def reset_water():
     return jsonify({"status": "ok", "water": water})
 
 
-# ─── USDA FoodData Central fallback ─────────────────────────────────────
 def _query_usda(query):
     """Query USDA FoodData Central API as a fallback for unknown foods."""
     api_key = USDA_API_KEY or "DEMO_KEY"
@@ -550,73 +660,183 @@ def _query_usda(query):
         return None
 
 
+# =============================================================================
+# === ROUTE: POST /analyze_photo — GROQ-ONLY VISION PIPELINE ===
+# =============================================================================
+# Two-step architecture using Groq for both steps (100% free, no billing):
+#   Step 1 (Groq Vision):  llama-4-scout identifies food + quantity from image
+#   Step 2 (Groq Text):    llama-4-scout calculates accurate macros from food name
+#   Fallback:              Local DB → USDA if Groq text step fails
+#
+# Input:  {image: base64 data URL string}
+# Output: {status, food_name, quantity_g, nutrition{calories, protein, carbs, fats}}
+# =============================================================================
 @app.route("/analyze_photo", methods=["POST"])
+@limiter.limit("15 per minute; 80 per hour")
 def analyze_photo():
     try:
         data = request.get_json(silent=True)
         if not data or "image" not in data:
             return jsonify({"status": "error", "message": "No image provided"}), 400
 
-        image_url = data["image"]
+        if not groq_client:
+            return jsonify({"status": "error", "message": "GROQ_API_KEY not configured. Get one free at console.groq.com"}), 500
 
-        response = openai_client.chat.completions.create(
-            model="gpt-4o-mini",
-            messages=[
-                {
+        image_url = data["image"]  # full data URL — Groq accepts this directly
+        manual_name = str(data.get("manual_name", "")).strip()
+        manual_grams = data.get("manual_grams")
+        try:
+            manual_grams = float(manual_grams) if manual_grams else None
+        except (ValueError, TypeError):
+            manual_grams = None
+
+        # ── STEP 1: Groq Vision — identify food from photo ──────────────────
+        # If user gave a manual description, bake it into the prompt for accuracy
+        if manual_name:
+            vision_prompt = (
+                f"Look at this food photo. The user says it contains: \"{manual_name}\". "
+                f"Use that as your primary food identification. "
+                f"Estimate the total weight in grams as served"
+                + (f" (user estimates ~{manual_grams}g)." if manual_grams else ".") +
+                " Respond ONLY with a JSON object — no markdown, no extra text — "
+                "using exactly these keys: "
+                '{"food_name": "name of the food", "quantity_g": 150, '
+                '"description": "brief description of what you see"}'
+            )
+        else:
+            vision_prompt = (
+                "Look at this food photo. Identify the main food item visible and "
+                "estimate its weight in grams as served. "
+                "Respond ONLY with a JSON object — no markdown, no extra text — "
+                "using exactly these keys: "
+                '{"food_name": "name of the food", "quantity_g": 150, '
+                '"description": "brief description of what you see"}'
+            )
+
+        try:
+            groq_response = groq_client.chat.completions.create(
+                model="meta-llama/llama-4-scout-17b-16e-instruct",
+                messages=[{
                     "role": "user",
                     "content": [
-                        {
-                            "type": "text",
-                            "text": (
-                                "You are a nutrition expert. Look at this food photo and identify "
-                                "the main food item. Estimate its weight in grams as served. "
-                                "Respond ONLY with a JSON object — no markdown, no extra text — "
-                                "using exactly these two keys: "
-                                '{"food_name": "name of the food", "quantity_g": 150}'
-                            )
-                        },
-                        {
-                            "type": "image_url",
-                            "image_url": {"url": image_url}
-                        }
+                        {"type": "text", "text": vision_prompt},
+                        {"type": "image_url", "image_url": {"url": image_url}}
                     ]
-                }
-            ],
-            max_tokens=100
-        )
+                }],
+                max_tokens=200,
+                temperature=0.1,
+            )
+        except Exception as groq_err:
+            err_str = str(groq_err)
+            if "429" in err_str or "rate" in err_str.lower() or "quota" in err_str.lower():
+                return jsonify({
+                    "status": "error",
+                    "message": "Vision AI rate limited. Wait a moment and try again."
+                }), 429
+            raise
 
-        raw = response.choices[0].message.content.strip()
-        # Robust JSON extraction — strip markdown fences if present
-        raw = re.sub(r"```json|```", "", raw).strip()
+        groq_raw = groq_response.choices[0].message.content.strip()
+        groq_raw = re.sub(r"```json|```", "", groq_raw).strip()
+        logger.info(f"Groq Vision raw: {groq_raw[:200]}")
+
         try:
-            ai_data = json.loads(raw)
+            groq_data = json.loads(groq_raw)
         except json.JSONDecodeError:
-            m = re.search(r'\{[^}]+\}', raw, re.DOTALL)
+            m = re.search(r'\{[^}]+\}', groq_raw, re.DOTALL)
             if m:
-                ai_data = json.loads(m.group())
+                groq_data = json.loads(m.group())
             else:
-                return jsonify({"status": "error", "message": "AI response could not be parsed. Try again."}), 500
+                return jsonify({"status": "error", "message": "Vision AI couldn't parse the image. Try a clearer photo."}), 500
 
-        food_name = str(ai_data.get("food_name", "")).strip()
-        quantity_g = float(ai_data.get("quantity_g", 100))
+        food_name = str(groq_data.get("food_name", "")).strip()
+        quantity_g = float(groq_data.get("quantity_g", 100))
+        description = str(groq_data.get("description", food_name))
+        # Manual overrides always win over AI guess
+        if manual_name:
+            food_name = manual_name
+        if manual_grams:
+            quantity_g = manual_grams
 
+        if not food_name:
+            return jsonify({"status": "error", "message": "Could not identify food in the image."}), 400
+
+        logger.info(f"Step 1 complete → food: {food_name}, qty: {quantity_g}g")
+
+        # ── STEP 2: Groq Text — calculate macros ────────────────────────────
+        # Uses same Groq client (text-only call, very fast, free tier)
+        groq_macros = None
+        macro_prompt = (
+            f"You are a nutrition database. Give accurate nutritional values for:\n"
+            f"Food: {food_name}\n"
+            f"Serving size: {quantity_g}g\n"
+            f"Description: {description}\n\n"
+            f"Respond ONLY with a JSON object, no markdown, no extra text:\n"
+            f'{{"calories": 250, "protein": 12.5, "carbs": 30.0, "fats": 8.5}}'
+        )
+        try:
+            macro_response = groq_client.chat.completions.create(
+                model="meta-llama/llama-4-scout-17b-16e-instruct",
+                messages=[{"role": "user", "content": macro_prompt}],
+                max_tokens=100,
+                temperature=0.1,
+            )
+            macro_raw = macro_response.choices[0].message.content.strip()
+            macro_raw = re.sub(r"```json|```", "", macro_raw).strip()
+            logger.info(f"Groq Macro raw: {macro_raw[:200]}")
+            try:
+                groq_macros = json.loads(macro_raw)
+            except json.JSONDecodeError:
+                m = re.search(r'\{[^}]+\}', macro_raw, re.DOTALL)
+                if m:
+                    groq_macros = json.loads(m.group())
+        except Exception as macro_err:
+            logger.warning(f"Groq macro step failed: {macro_err}")
+
+        # ── Use Groq macros if valid ─────────────────────────────────────────
+        if groq_macros and all(k in groq_macros for k in ("calories", "protein", "carbs", "fats")):
+            logger.info(f"Step 2 complete → macros: {groq_macros}")
+            return jsonify({
+                "status": "ok",
+                "food_name": food_name.title(),
+                "quantity_g": round(quantity_g, 1),
+                "nutrition": {
+                    "calories": round(float(groq_macros["calories"]), 1),
+                    "protein":  round(float(groq_macros["protein"]),  1),
+                    "carbs":    round(float(groq_macros["carbs"]),    1),
+                    "fats":     round(float(groq_macros["fats"]),     1),
+                },
+                "source": "groq+groq"
+            })
+
+        # ── FALLBACK: Local DB → USDA ────────────────────────────────────────
+        logger.info("Groq macro step unavailable — falling back to local DB / USDA")
         matched_key, score = _fuzzy_match(food_name)
 
-        # Fallback to USDA if local DB miss
         if (not matched_key or score < 0.2) and food_name:
             usda = _query_usda(food_name)
             if usda:
-                NUTRITION_DB[usda["name"]] = {
+                usda_nd = {
                     "calories": usda["calories"], "protein": usda["protein"],
                     "carbs": usda["carbs"], "fats": usda["fats"]
                 }
-                matched_key, score = usda["name"], 0.9
+                return jsonify({
+                    "status": "ok",
+                    "food_name": usda["name"].title(),
+                    "quantity_g": round(quantity_g, 1),
+                    "nutrition": {
+                        "calories": _scale(usda_nd["calories"], quantity_g),
+                        "protein":  _scale(usda_nd["protein"],  quantity_g),
+                        "carbs":    _scale(usda_nd["carbs"],    quantity_g),
+                        "fats":     _scale(usda_nd["fats"],     quantity_g),
+                    },
+                    "source": "groq+usda"
+                })
 
         if not matched_key or score < 0.2:
             return jsonify({
                 "status": "not_found",
-                "message": f"AI identified '{food_name}', but it's not in our database. Add manually."
-            })
+                "message": f"AI identified '{food_name}' (~{quantity_g}g), but couldn't calculate macros. Add manually."
+            }), 404
 
         nd = NUTRITION_DB[matched_key]
         return jsonify({
@@ -628,7 +848,8 @@ def analyze_photo():
                 "protein":  _scale(nd["protein"],  quantity_g),
                 "carbs":    _scale(nd["carbs"],     quantity_g),
                 "fats":     _scale(nd["fats"],      quantity_g),
-            }
+            },
+            "source": "groq+localdb"
         })
 
     except Exception as e:
@@ -638,12 +859,15 @@ def analyze_photo():
 
 @app.route("/health")
 def health():
-    """Debug endpoint — check keys and config."""
+    """Debug endpoint — only available outside production."""
+    if IS_PROD:
+        return jsonify({"status": "ok"}), 200
     return jsonify({
         "status": "ok",
-        "openai_key_set": bool(os.getenv("OPENAI_API_KEY")),
-        "usda_key_set":   bool(os.getenv("USDA_API_KEY")),
+        "groq_key_set": bool(GROQ_API_KEY),
+        "usda_key_set": bool(USDA_API_KEY),
         "db_foods": len(NUTRITION_DB),
+        "pipeline": "groq_vision → groq_text → localdb/usda fallback",
     })
 
 
@@ -660,5 +884,5 @@ def search_usda_route():
 
 
 if __name__ == "__main__":
-   port = int(os.environ.get("PORT", 5000))
-   app.run(host="0.0.0.0", port=port, debug=False)
+    port = int(os.environ.get("PORT", 5000))
+    app.run(host="0.0.0.0", port=port, debug=False)

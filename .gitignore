@@ -1,10 +1,41 @@
-# Secrets
+# === SECRETS — NEVER COMMIT ===
 .env
+*.env
 
 # Python
 __pycache__/
-*.pyc
-
-# Virtual env (optional)
+*.py[cod]
+*.pyo
+*.pyd
+*.egg-info/
+dist/
+build/
+.eggs/
+*.egg
 venv/
 env/
+.venv/
+
+# Flask
+instance/
+.webassets-cache
+flask_session/
+
+# OS
+.DS_Store
+Thumbs.db
+desktop.ini
+
+# Editor
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# Logs
+*.log
+logs/
+
+# Production uploads / temp files
+uploads/
+tmp/
