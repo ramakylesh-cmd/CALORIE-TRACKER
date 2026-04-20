@@ -12,7 +12,7 @@ export const API_BASE_URL = __DEV__
       ios: 'http://localhost:5000',
       default: 'http://localhost:5000',
     })!
-  : 'https://nutripulse-api.onrender.com';
+  : 'https://nutripulse-api.onrender.com';  // ✅ Live Render backend
 
 export const GOOGLE_CLIENT_ID =
   '236595548964-mdlk7q8lgkipcbsu1lcssmnti6u34fp8.apps.googleusercontent.com';

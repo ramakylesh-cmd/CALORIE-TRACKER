@@ -16,7 +16,7 @@ services:
     name: nutripulse-api
     runtime: python
     plan: free
-    buildCommand: "./build.sh"
+    buildCommand: "pip install --upgrade pip && pip install -r requirements.txt"
     startCommand: "gunicorn wsgi:app --bind 0.0.0.0:$PORT --workers 2 --timeout 120"
     envVars:
       - key: DATABASE_URL
