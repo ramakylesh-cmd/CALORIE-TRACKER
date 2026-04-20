@@ -974,7 +974,16 @@ async function analysePhoto() {
     stageTimers.forEach(t => clearTimeout(t));
     progressBar.classList.remove("visible");
     progressFill.style.width = "0%";
-    showPhotoFeedback(err.message || "Photo analysis failed. Check your API key or add food manually.", "error");
+    // Provide helpful error messages instead of raw "Failed to fetch"
+    let userMsg;
+    if (err.message === "Failed to fetch" || err.name === "TypeError") {
+      userMsg = "Cannot reach server. Make sure the Flask server is running (python app.py).";
+    } else if (err.message.includes("rate limit") || err.message.includes("429")) {
+      userMsg = "AI rate limited — wait a moment and try again.";
+    } else {
+      userMsg = err.message || "Photo analysis failed. Check your API key or add food manually.";
+    }
+    showPhotoFeedback(userMsg, "error");
     console.error("Photo analysis error:", err);
   } finally {
     analyseBtn.disabled = false;

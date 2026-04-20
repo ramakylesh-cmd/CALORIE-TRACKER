@@ -36,6 +36,16 @@ desktop.ini
 *.log
 logs/
 
+# Database
+*.db
+*.sqlite3
+
+# Node (React Native)
+node_modules/
+.expo/
+*.apk
+*.aab
+
 # Production uploads / temp files
 uploads/
 tmp/
